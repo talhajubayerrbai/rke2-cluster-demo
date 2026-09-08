@@ -19,6 +19,7 @@ env:
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 1: Terraform — provision EC2 x2, ALB, SGs, key pair
+  # State is stored in S3 (TF_STATE_BUCKET secret, TF_STATE_KEY var)
   # ────────────────────────────────────────────────────────────────────────────
   terraform:
     name: Terraform — Provision Infrastructure
@@ -35,43 +36,29 @@ jobs:
         with:
           ref: ${{ inputs.revision || github.sha }}
 
-      - name: Restore previous Terraform state (if any)
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform-state
-        continue-on-error: true
-
-      - name: Place state file into terraform/ directory
-        run: |
-          if [ -f terraform.tfstate ]; then
-            mv -f terraform.tfstate terraform/
-            echo "State file restored."
-          else
-            echo "No prior state — fresh deploy."
-          fi
-          if [ -f rke2-key.pem ]; then
-            mv -f rke2-key.pem ansible/
-            chmod 600 ansible/rke2-key.pem
-          fi
-
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: Terraform Init
+      - name: Terraform Init (S3 backend)
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: terraform init -input=false
+        run: |
+          terraform init -input=false -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
 
       - name: Terraform Plan
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
         run: terraform plan -input=false -out=tfplan
 
       - name: Terraform Apply
@@ -79,6 +66,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
         run: terraform apply -input=false -auto-approve tfplan
 
       - name: Capture Terraform Outputs
@@ -87,6 +75,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
         run: |
           ALB_DNS=$(terraform output -raw alb_dns_name)
           SERVER_IP=$(terraform output -raw server_public_ip)
@@ -107,20 +96,17 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
         run: |
           terraform output -raw private_key_pem > ../ansible/rke2-key.pem
           chmod 600 ../ansible/rke2-key.pem
 
-      - name: Upload terraform state + key artifact
+      - name: Upload private key artifact (for ansible job)
         uses: actions/upload-artifact@v4
         with:
-          name: terraform-state
-          path: |
-            terraform/terraform.tfstate
-            terraform/terraform.tfstate.backup
-            ansible/rke2-key.pem
-          retention-days: 7
-          overwrite: true
+          name: rke2-key
+          path: ansible/rke2-key.pem
+          retention-days: 1
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 2: Ansible — bootstrap RKE2 server + agent
@@ -136,15 +122,14 @@ jobs:
         with:
           ref: ${{ inputs.revision || github.sha }}
 
-      - name: Download terraform artifact
+      - name: Download private key artifact
         uses: actions/download-artifact@v4
         with:
-          name: terraform-state
+          name: rke2-key
 
-      - name: Restore artifact paths
+      - name: Place private key
         run: |
-          mv -f terraform.tfstate terraform/ 2>/dev/null || true
-          mv -f rke2-key.pem ansible/ 2>/dev/null || true
+          mv -f rke2-key.pem ansible/ 2>/dev/null || mv -f *.pem ansible/ 2>/dev/null || true
           chmod 600 ansible/rke2-key.pem
 
       - name: Install Ansible

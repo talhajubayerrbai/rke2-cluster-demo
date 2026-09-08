@@ -1,5 +1,11 @@
 terraform {
   required_version = ">= 1.3.0"
+
+  backend "s3" {
+    # bucket, key, and region are passed via -backend-config flags in CI
+    # to avoid hardcoding values in source
+  }
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
