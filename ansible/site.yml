@@ -1,0 +1,14 @@
+---
+- name: Bootstrap RKE2 server node
+  hosts: rke2_server
+  become: true
+  gather_facts: true
+  roles:
+    - rke2_server
+
+- name: Bootstrap RKE2 agent node
+  hosts: rke2_agent
+  become: true
+  gather_facts: true
+  roles:
+    - rke2_agent

@@ -1,0 +1,16 @@
+controller:
+  service:
+    type: NodePort
+    nodePorts:
+      http: 30080
+      https: 30443
+  # Ensure the ingress controller responds to /healthz for ALB health checks
+  healthCheckPath: /healthz
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: 10254
+  readinessProbe:
+    httpGet:
+      path: /healthz
+      port: 10254

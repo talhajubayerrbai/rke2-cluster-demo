@@ -1,0 +1,6 @@
+# RKE2 server configuration
+write-kubeconfig-mode: "0644"
+tls-san:
+  - "{{ ansible_host }}"
+  - "{{ ansible_default_ipv4.address }}"
+node-ip: "{{ ansible_default_ipv4.address }}"

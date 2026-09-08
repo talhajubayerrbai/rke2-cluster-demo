@@ -1,0 +1,4 @@
+# RKE2 agent configuration
+server: "https://{{ groups['rke2_server'][0] }}:9345"
+token: "{{ hostvars['rke2_token_holder']['rke2_node_token'] }}"
+node-ip: "{{ ansible_default_ipv4.address }}"
