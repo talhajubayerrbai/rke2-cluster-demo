@@ -46,25 +46,30 @@ jobs:
           aws ec2 describe-instances \
             --region $AWS_REGION \
             --filters "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
-            --query 'Reservations[].Instances[].{InstanceId:InstanceId,Type:InstanceType,State:State.Name,VpcId:VpcId,Name:Tags[?Key==`Name`]|[0].Value,Tags:Tags}' \
+            --query 'Reservations[].Instances[].{InstanceId:InstanceId,Type:InstanceType,State:State.Name,VpcId:VpcId,Tags:Tags}' \
             --output json
 
       # ── STEP 3: Terminate rke2 EC2 instances ────────────────────────────
+      # Use AWS-side tag filter (Name=tag:Name,Values=*rke2*) to avoid
+      # JMESPath contains(null, ...) error when instances have no Name tag.
       - name: "Step 3 — Terminate rke2 EC2 instances"
         run: |
           set -e
-          echo "=== AUTO-DISCOVERING rke2 INSTANCES BY Name TAG ==="
+          echo "=== AUTO-DISCOVERING rke2 INSTANCES BY Name TAG (AWS filter) ==="
           IDS=$(aws ec2 describe-instances \
             --region $AWS_REGION \
-            --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`) && VpcId!=`'"$DEFAULT_VPC"'`].InstanceId' \
+            --filters \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              "Name=tag:Name,Values=*rke2*" \
+            --query 'Reservations[].Instances[?VpcId!=`'"$DEFAULT_VPC"'`].InstanceId' \
             --output text)
-          echo "Instances to terminate: $IDS"
+          echo "Instances to terminate: ${IDS:-none}"
           if [ -z "$IDS" ]; then
             echo "No rke2 instances found — skipping termination."
           else
+            echo "=== PRE-TERMINATION STATE ==="
             aws ec2 describe-instances --region $AWS_REGION --instance-ids $IDS \
-              --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value}' \
+              --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Tags:Tags}' \
               --output json
             echo "=== TERMINATING ==="
             aws ec2 terminate-instances --region $AWS_REGION --instance-ids $IDS --output json
@@ -72,16 +77,19 @@ jobs:
           fi
 
       # ── STEP 4: Wait for EC2 termination ────────────────────────────────
+      # Same pattern: AWS-side tag filter avoids null JMESPath issue.
       - name: "Step 4 — Wait for rke2 instances to reach terminated state"
         run: |
           set -e
-          echo "=== DISCOVERING INSTANCES IN SHUTTING-DOWN OR TERMINATED STATE ==="
+          echo "=== DISCOVERING rke2 INSTANCES IN shutting-down OR terminated STATE ==="
           IDS=$(aws ec2 describe-instances \
             --region $AWS_REGION \
-            --filters "Name=instance-state-name,Values=shutting-down,terminated" \
-            --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`)].InstanceId' \
+            --filters \
+              "Name=instance-state-name,Values=shutting-down,terminated" \
+              "Name=tag:Name,Values=*rke2*" \
+            --query 'Reservations[].Instances[].InstanceId' \
             --output text)
-          echo "Waiting on: $IDS"
+          echo "Waiting on: ${IDS:-none}"
           if [ -z "$IDS" ]; then
             echo "No rke2 instances in shutting-down/terminated state — nothing to wait for."
           else
@@ -479,13 +487,16 @@ jobs:
           echo "DELETED BUCKET: $BUCKET"
 
       # ── STEP 16: Final sweep ─────────────────────────────────────────────
+      # Uses AWS-side tag filters throughout — no JMESPath contains() on null.
       - name: "Step 16 — Final sweep (confirm zero orphaned resources)"
         run: |
           echo "=== FINAL SWEEP ==="
-          echo "--- EC2 (non-terminated, rke2/calculator tagged) ---"
+          echo "--- EC2 (non-terminated, Name tag contains rke2 or calculator) ---"
           aws ec2 describe-instances --region $AWS_REGION \
-            --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`) || contains(Tags[?Key==`Name`]|[0].Value,`calculator`)].{ID:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value}' \
+            --filters \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              "Name=tag:Name,Values=*rke2*,*calculator*" \
+            --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Tags:Tags}' \
             --output json 2>/dev/null || echo "[]"
           echo "--- ALBs (rke2-*) ---"
           aws elbv2 describe-load-balancers --region $AWS_REGION \
