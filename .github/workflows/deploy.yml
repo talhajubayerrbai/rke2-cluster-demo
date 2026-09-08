@@ -35,6 +35,25 @@ jobs:
         with:
           ref: ${{ inputs.revision || github.sha }}
 
+      - name: Restore previous Terraform state (if any)
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-state
+        continue-on-error: true
+
+      - name: Place state file into terraform/ directory
+        run: |
+          if [ -f terraform.tfstate ]; then
+            mv -f terraform.tfstate terraform/
+            echo "State file restored."
+          else
+            echo "No prior state — fresh deploy."
+          fi
+          if [ -f rke2-key.pem ]; then
+            mv -f rke2-key.pem ansible/
+            chmod 600 ansible/rke2-key.pem
+          fi
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -74,9 +93,9 @@ jobs:
           AGENT_IP=$(terraform output -raw agent_public_ip)
           SERVER_PRIVATE=$(terraform output -raw server_private_ip)
 
-          echo "alb_dns_name=${ALB_DNS}"         >> "$GITHUB_OUTPUT"
-          echo "server_public_ip=${SERVER_IP}"   >> "$GITHUB_OUTPUT"
-          echo "agent_public_ip=${AGENT_IP}"     >> "$GITHUB_OUTPUT"
+          echo "alb_dns_name=${ALB_DNS}"             >> "$GITHUB_OUTPUT"
+          echo "server_public_ip=${SERVER_IP}"       >> "$GITHUB_OUTPUT"
+          echo "agent_public_ip=${AGENT_IP}"         >> "$GITHUB_OUTPUT"
           echo "server_private_ip=${SERVER_PRIVATE}" >> "$GITHUB_OUTPUT"
 
           echo "ALB DNS: ${ALB_DNS}"
@@ -100,7 +119,8 @@ jobs:
             terraform/terraform.tfstate
             terraform/terraform.tfstate.backup
             ansible/rke2-key.pem
-          retention-days: 1
+          retention-days: 7
+          overwrite: true
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 2: Ansible — bootstrap RKE2 server + agent
@@ -123,7 +143,6 @@ jobs:
 
       - name: Restore artifact paths
         run: |
-          # artifact downloads to cwd; restore to expected locations
           mv -f terraform.tfstate terraform/ 2>/dev/null || true
           mv -f rke2-key.pem ansible/ 2>/dev/null || true
           chmod 600 ansible/rke2-key.pem
@@ -273,7 +292,7 @@ jobs:
       - name: Wait for ALB to become healthy (up to 5 minutes)
         run: |
           ALB_DNS="${{ needs.terraform.outputs.alb_dns_name }}"
-          echo "Polling http://hello.${ALB_DNS} ..."
+          echo "Polling http://${ALB_DNS} with Host: hello.${ALB_DNS} ..."
           for i in $(seq 1 30); do
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Host: hello.${ALB_DNS}" \
