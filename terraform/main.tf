@@ -1,15 +1,14 @@
 terraform {
   required_version = ">= 1.3.0"
 
-  backend "s3" {
-    # bucket, key, and region are passed via -backend-config flags in CI
-    # to avoid hardcoding values in source
-  }
+  # Local state — no backend configuration needed for this demo.
+  # Each pipeline run starts fresh; resources are created anew and
+  # destroyed at end-of-life via the destroy workflow.
 
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "= 5.31.0"
     }
     tls = {
       source  = "hashicorp/tls"
@@ -45,8 +44,9 @@ resource "tls_private_key" "rke2" {
 }
 
 resource "aws_key_pair" "rke2" {
-  key_name   = "rke2-cluster-demo-key"
-  public_key = tls_private_key.rke2.public_key_openssh
+  key_name_prefix = "rke2-cluster-demo-"
+  public_key      = tls_private_key.rke2.public_key_openssh
+  tags            = { Name = "rke2-cluster-demo" }
 }
 
 # Write private key so Ansible can use it
@@ -60,7 +60,7 @@ resource "local_file" "private_key" {
 
 # ALB security group — accepts public HTTP/HTTPS
 resource "aws_security_group" "alb" {
-  name        = "rke2-alb-sg"
+  name_prefix = "rke2-alb-sg-"
   description = "Allow HTTP/HTTPS inbound to ALB"
   vpc_id      = data.aws_vpc.default.id
 
@@ -88,11 +88,15 @@ resource "aws_security_group" "alb" {
   }
 
   tags = { Name = "rke2-alb-sg" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Node security group — inter-node + ALB + SSH
 resource "aws_security_group" "nodes" {
-  name        = "rke2-nodes-sg"
+  name_prefix = "rke2-nodes-sg-"
   description = "RKE2 cluster node security group"
   vpc_id      = data.aws_vpc.default.id
 
@@ -175,6 +179,10 @@ resource "aws_security_group" "nodes" {
   }
 
   tags = { Name = "rke2-nodes-sg" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # ── EC2 Instances ─────────────────────────────────────────────────────────────
@@ -212,7 +220,7 @@ resource "aws_instance" "agent" {
 
 # ── Application Load Balancer ─────────────────────────────────────────────────
 resource "aws_lb" "rke2" {
-  name               = "rke2-cluster-alb"
+  name_prefix        = "rke2-"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
@@ -222,7 +230,7 @@ resource "aws_lb" "rke2" {
 }
 
 resource "aws_lb_target_group" "ingress" {
-  name        = "rke2-ingress-tg"
+  name_prefix = "rke2-"
   port        = 30080
   protocol    = "HTTP"
   vpc_id      = data.aws_vpc.default.id
@@ -240,6 +248,10 @@ resource "aws_lb_target_group" "ingress" {
   }
 
   tags = { Name = "rke2-ingress-tg" }
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 # Register both nodes so ALB can reach either

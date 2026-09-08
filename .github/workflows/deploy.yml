@@ -13,13 +13,14 @@ on:
         default: ''
 
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_REGION: us-east-1
   TF_VERSION: "1.7.5"
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 1: Terraform — provision EC2 x2, ALB, SGs, key pair
-  # State is in S3. Import step reconciles any pre-existing resources.
+  # Uses local state (demo). name_prefix on all AWS resources avoids
+  # duplicate-name conflicts across runs.
   # ────────────────────────────────────────────────────────────────────────────
   terraform:
     name: Terraform — Provision Infrastructure
@@ -36,113 +37,22 @@ jobs:
         with:
           ref: ${{ inputs.revision || github.sha }}
 
-      - name: Setup Terraform
+      - name: Setup Terraform ${{ env.TF_VERSION }}
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: Terraform Init (S3 backend)
+      - name: Terraform Init (local backend)
         working-directory: terraform
-        env:
-          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
-        run: |
-          terraform init -input=false -reconfigure \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
-            -backend-config="region=${{ vars.AWS_REGION }}"
-
-      - name: Import pre-existing AWS resources into Terraform state
-        working-directory: terraform
-        env:
-          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
-        run: |
-          set +e   # don't exit on error — imports silently fail if resource not found or already in state
-
-          # Helper: import only if not already in state
-          import_if_missing() {
-            local resource=$1
-            local id=$2
-            if [ -z "$id" ]; then return; fi
-            if terraform state show "$resource" >/dev/null 2>&1; then
-              echo "SKIP: $resource already in state"
-            else
-              echo "Importing $resource ($id)..."
-              terraform import "$resource" "$id" || echo "WARN: import $resource failed (may not exist yet)"
-            fi
-          }
-
-          # Key pair
-          KP_ID=$(aws ec2 describe-key-pairs --key-names rke2-cluster-demo-key \
-            --query 'KeyPairs[0].KeyPairId' --output text 2>/dev/null || echo "")
-          import_if_missing "aws_key_pair.rke2" "rke2-cluster-demo-key"
-
-          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true \
-            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
-          echo "Default VPC: $VPC_ID"
-
-          # Security groups
-          ALB_SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=rke2-alb-sg" "Name=vpc-id,Values=$VPC_ID" \
-            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null | grep -v None || echo "")
-          import_if_missing "aws_security_group.alb" "$ALB_SG_ID"
-
-          NODES_SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=rke2-nodes-sg" "Name=vpc-id,Values=$VPC_ID" \
-            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null | grep -v None || echo "")
-          import_if_missing "aws_security_group.nodes" "$NODES_SG_ID"
-
-          # EC2 instances
-          SERVER_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=rke2-server" "Name=instance-state-name,Values=running,stopped,pending" \
-            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v None || echo "")
-          import_if_missing "aws_instance.server" "$SERVER_ID"
-
-          AGENT_ID=$(aws ec2 describe-instances \
-            --filters "Name=tag:Name,Values=rke2-agent" "Name=instance-state-name,Values=running,stopped,pending" \
-            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v None || echo "")
-          import_if_missing "aws_instance.agent" "$AGENT_ID"
-
-          # ALB
-          ALB_ARN=$(aws elbv2 describe-load-balancers --names rke2-cluster-alb \
-            --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null | grep -v None || echo "")
-          import_if_missing "aws_lb.rke2" "$ALB_ARN"
-
-          # Target group
-          TG_ARN=$(aws elbv2 describe-target-groups --names rke2-ingress-tg \
-            --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null | grep -v None || echo "")
-          import_if_missing "aws_lb_target_group.ingress" "$TG_ARN"
-
-          # ALB listener
-          if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
-            LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
-              --query 'Listeners[0].ListenerArn' --output text 2>/dev/null | grep -v None || echo "")
-            import_if_missing "aws_lb_listener.http" "$LISTENER_ARN"
-          fi
-
-          # Target group attachments (server and agent)
-          if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
-            if [ -n "$SERVER_ID" ] && [ "$SERVER_ID" != "None" ]; then
-              import_if_missing "aws_lb_target_group_attachment.server" "${TG_ARN}/${SERVER_ID}/30080"
-            fi
-            if [ -n "$AGENT_ID" ] && [ "$AGENT_ID" != "None" ]; then
-              import_if_missing "aws_lb_target_group_attachment.agent" "${TG_ARN}/${AGENT_ID}/30080"
-            fi
-          fi
-
-          echo "Import phase complete."
-          set -e
+        run: terraform init -input=false
 
       - name: Terraform Plan
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
+          AWS_DEFAULT_REGION:    us-east-1
         run: terraform plan -input=false -out=tfplan
 
       - name: Terraform Apply
@@ -150,7 +60,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
+          AWS_DEFAULT_REGION:    us-east-1
         run: terraform apply -input=false -auto-approve tfplan
 
       - name: Capture Terraform Outputs
@@ -159,7 +69,7 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
+          AWS_DEFAULT_REGION:    us-east-1
         run: |
           ALB_DNS=$(terraform output -raw alb_dns_name)
           SERVER_IP=$(terraform output -raw server_public_ip)
@@ -171,19 +81,22 @@ jobs:
           echo "agent_public_ip=${AGENT_IP}"         >> "$GITHUB_OUTPUT"
           echo "server_private_ip=${SERVER_PRIVATE}" >> "$GITHUB_OUTPUT"
 
-          echo "ALB DNS: ${ALB_DNS}"
+          echo "============================================"
+          echo "ALB DNS:          ${ALB_DNS}"
           echo "Server public IP: ${SERVER_IP}"
           echo "Agent public IP:  ${AGENT_IP}"
+          echo "============================================"
 
-      - name: Export private key from Terraform
+      - name: Export private key for Ansible
         working-directory: terraform
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
+          AWS_DEFAULT_REGION:    us-east-1
         run: |
           terraform output -raw private_key_pem > ../ansible/rke2-key.pem
           chmod 600 ../ansible/rke2-key.pem
+          echo "Private key written to ansible/rke2-key.pem"
 
       - name: Upload private key artifact (for ansible job)
         uses: actions/upload-artifact@v4
@@ -213,7 +126,8 @@ jobs:
 
       - name: Place private key
         run: |
-          mv -f rke2-key.pem ansible/ 2>/dev/null || true
+          mkdir -p ansible
+          mv -f rke2-key.pem ansible/rke2-key.pem 2>/dev/null || true
           chmod 600 ansible/rke2-key.pem
 
       - name: Install Ansible
@@ -229,16 +143,16 @@ jobs:
           mkdir -p ansible/inventory
           cat > ansible/inventory/hosts.ini <<EOF
           [rke2_server]
-          ${SERVER_IP} ansible_user=ubuntu ansible_ssh_private_key_file=./rke2-key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ${SERVER_IP} ansible_user=ubuntu ansible_ssh_private_key_file=../ansible/rke2-key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=no'
 
           [rke2_agent]
-          ${AGENT_IP} ansible_user=ubuntu ansible_ssh_private_key_file=./rke2-key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ${AGENT_IP} ansible_user=ubuntu ansible_ssh_private_key_file=../ansible/rke2-key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=no'
           EOF
 
           echo "Inventory written:"
           cat ansible/inventory/hosts.ini
 
-      - name: Wait for EC2 SSH to be available (server)
+      - name: Wait for EC2 SSH — server
         run: |
           SERVER_IP="${{ needs.terraform.outputs.server_public_ip }}"
           echo "Waiting for SSH on ${SERVER_IP}..."
@@ -252,7 +166,7 @@ jobs:
             sleep 10
           done
 
-      - name: Wait for EC2 SSH to be available (agent)
+      - name: Wait for EC2 SSH — agent
         run: |
           AGENT_IP="${{ needs.terraform.outputs.agent_public_ip }}"
           echo "Waiting for SSH on ${AGENT_IP}..."
@@ -310,7 +224,7 @@ jobs:
       - name: Place kubeconfig
         run: |
           mkdir -p ~/.kube
-          mv config ~/.kube/config
+          mv -f config ~/.kube/config 2>/dev/null || mv -f kubeconfig ~/.kube/config 2>/dev/null || true
           chmod 600 ~/.kube/config
 
       - name: Verify cluster connectivity
