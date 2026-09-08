@@ -19,7 +19,7 @@ env:
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 1: Terraform — provision EC2 x2, ALB, SGs, key pair
-  # State is stored in S3 (TF_STATE_BUCKET secret, TF_STATE_KEY var)
+  # State is in S3. Import step reconciles any pre-existing resources.
   # ────────────────────────────────────────────────────────────────────────────
   terraform:
     name: Terraform — Provision Infrastructure
@@ -47,11 +47,95 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
         run: |
           terraform init -input=false -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=${{ vars.TF_STATE_KEY }}" \
             -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: Import pre-existing AWS resources into Terraform state
+        working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    ${{ vars.AWS_REGION }}
+        run: |
+          set +e   # don't exit on error — imports silently fail if resource not found or already in state
+
+          # Helper: import only if not already in state
+          import_if_missing() {
+            local resource=$1
+            local id=$2
+            if [ -z "$id" ]; then return; fi
+            if terraform state show "$resource" >/dev/null 2>&1; then
+              echo "SKIP: $resource already in state"
+            else
+              echo "Importing $resource ($id)..."
+              terraform import "$resource" "$id" || echo "WARN: import $resource failed (may not exist yet)"
+            fi
+          }
+
+          # Key pair
+          KP_ID=$(aws ec2 describe-key-pairs --key-names rke2-cluster-demo-key \
+            --query 'KeyPairs[0].KeyPairId' --output text 2>/dev/null || echo "")
+          import_if_missing "aws_key_pair.rke2" "rke2-cluster-demo-key"
+
+          VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true \
+            --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
+          echo "Default VPC: $VPC_ID"
+
+          # Security groups
+          ALB_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=rke2-alb-sg" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null | grep -v None || echo "")
+          import_if_missing "aws_security_group.alb" "$ALB_SG_ID"
+
+          NODES_SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=rke2-nodes-sg" "Name=vpc-id,Values=$VPC_ID" \
+            --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null | grep -v None || echo "")
+          import_if_missing "aws_security_group.nodes" "$NODES_SG_ID"
+
+          # EC2 instances
+          SERVER_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=rke2-server" "Name=instance-state-name,Values=running,stopped,pending" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v None || echo "")
+          import_if_missing "aws_instance.server" "$SERVER_ID"
+
+          AGENT_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=rke2-agent" "Name=instance-state-name,Values=running,stopped,pending" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null | grep -v None || echo "")
+          import_if_missing "aws_instance.agent" "$AGENT_ID"
+
+          # ALB
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names rke2-cluster-alb \
+            --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null | grep -v None || echo "")
+          import_if_missing "aws_lb.rke2" "$ALB_ARN"
+
+          # Target group
+          TG_ARN=$(aws elbv2 describe-target-groups --names rke2-ingress-tg \
+            --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null | grep -v None || echo "")
+          import_if_missing "aws_lb_target_group.ingress" "$TG_ARN"
+
+          # ALB listener
+          if [ -n "$ALB_ARN" ] && [ "$ALB_ARN" != "None" ]; then
+            LISTENER_ARN=$(aws elbv2 describe-listeners --load-balancer-arn "$ALB_ARN" \
+              --query 'Listeners[0].ListenerArn' --output text 2>/dev/null | grep -v None || echo "")
+            import_if_missing "aws_lb_listener.http" "$LISTENER_ARN"
+          fi
+
+          # Target group attachments (server and agent)
+          if [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ]; then
+            if [ -n "$SERVER_ID" ] && [ "$SERVER_ID" != "None" ]; then
+              import_if_missing "aws_lb_target_group_attachment.server" "${TG_ARN}/${SERVER_ID}/30080"
+            fi
+            if [ -n "$AGENT_ID" ] && [ "$AGENT_ID" != "None" ]; then
+              import_if_missing "aws_lb_target_group_attachment.agent" "${TG_ARN}/${AGENT_ID}/30080"
+            fi
+          fi
+
+          echo "Import phase complete."
+          set -e
 
       - name: Terraform Plan
         working-directory: terraform
@@ -129,7 +213,7 @@ jobs:
 
       - name: Place private key
         run: |
-          mv -f rke2-key.pem ansible/ 2>/dev/null || mv -f *.pem ansible/ 2>/dev/null || true
+          mv -f rke2-key.pem ansible/ 2>/dev/null || true
           chmod 600 ansible/rke2-key.pem
 
       - name: Install Ansible
