@@ -1,40 +1,14 @@
-name: AWS Infrastructure Cleanup
+name: AWS Infrastructure Cleanup — Full Linear Run
 
 on:
   workflow_dispatch:
     inputs:
-      phase:
-        description: 'Which phase to run'
-        required: true
-        default: 'inventory'
-        type: choice
-        options:
-          - inventory
-          - ec2_only
-          - terminate_ec2
-          - wait_ec2_terminated
-          - alb_cleanup
-          - sg_cleanup
-          - keypair_cleanup
-          - ebs_cleanup
-          - eip_cleanup
-          - iam_cleanup
-          - vpc_summary
-          - vpc_delete_044a1d577502cb21f
-          - vpc_delete_06f8e83384de631d6
-          - vpc_delete_0818d68617434d141
-          - s3_cleanup
-          - final_sweep
-      instance_ids:
-        description: 'Space-separated EC2 instance IDs (for terminate_ec2 and wait phases)'
-        required: false
-        default: ''
       revision:
-        description: 'Git revision'
+        description: 'Git revision (UDAP internal)'
         required: false
         default: ''
       udap_run_id:
-        description: 'UDAP run identifier'
+        description: 'UDAP run identifier (UDAP internal)'
         required: false
         default: ''
 
@@ -43,216 +17,164 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   DEFAULT_VPC: vpc-08750793f051e477b
-  EFFECTIVE_PHASE: ${{ inputs.phase }}
+  VPC1: vpc-044a1d577502cb21f
+  VPC2: vpc-06f8e83384de631d6
+  VPC3: vpc-0818d68617434d141
+  S3_BUCKET: udap-calculator-tf-state-a7f3k9
 
 jobs:
   cleanup:
-    name: "AWS Cleanup — ${{ inputs.phase }}"
+    name: "Full AWS Cleanup — All Phases"
     runs-on: ubuntu-latest
 
     steps:
-      - name: Verify AWS identity
+
+      # ── STEP 1: Verify AWS identity ─────────────────────────────────────
+      - name: "Step 1 — Verify AWS identity"
         run: |
+          set -e
           echo "=== AWS IDENTITY ==="
           aws sts get-caller-identity
-          echo "Phase: $EFFECTIVE_PHASE"
+          echo "Region: $AWS_REGION"
+          echo "Default VPC (NEVER TOUCH): $DEFAULT_VPC"
 
-      # ────────────────────────────────────────────────────────────────────
-      # EC2 ONLY — compact JSON output for gate review
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[ec2_only] EC2 instance IDs and tags (compact)"
-        if: env.EFFECTIVE_PHASE == 'ec2_only'
+      # ── STEP 2: Describe non-terminated EC2 instances ───────────────────
+      - name: "Step 2 — Describe non-terminated EC2 instances"
         run: |
+          set -e
           echo "=== NON-TERMINATED EC2 INSTANCES ==="
           aws ec2 describe-instances \
             --region $AWS_REGION \
             --filters "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
-            --query 'Reservations[].Instances[].{InstanceId:InstanceId,Type:InstanceType,State:State.Name,LaunchTime:LaunchTime,VpcId:VpcId,Tags:Tags}' \
+            --query 'Reservations[].Instances[].{InstanceId:InstanceId,Type:InstanceType,State:State.Name,VpcId:VpcId,Name:Tags[?Key==`Name`]|[0].Value,Tags:Tags}' \
             --output json
-          echo "=== EC2 INVENTORY DONE ==="
-          echo "Live URL: ec2-inventory://done"
 
-      # ────────────────────────────────────────────────────────────────────
-      # INVENTORY — full read-only survey
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[inventory] Full estate inventory"
-        if: env.EFFECTIVE_PHASE == 'inventory'
+      # ── STEP 3: Terminate rke2 EC2 instances ────────────────────────────
+      - name: "Step 3 — Terminate rke2 EC2 instances"
         run: |
-          echo "=== NON-TERMINATED EC2 ==="
-          aws ec2 describe-instances \
+          set -e
+          echo "=== AUTO-DISCOVERING rke2 INSTANCES BY Name TAG ==="
+          IDS=$(aws ec2 describe-instances \
             --region $AWS_REGION \
-            --filters "Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down" \
-            --query 'Reservations[].Instances[].{InstanceId:InstanceId,Type:InstanceType,State:State.Name,Tags:Tags}' \
-            --output json
-          echo "=== ALBs (rke2) ==="
-          aws elbv2 describe-load-balancers --region $AWS_REGION \
-            --query 'LoadBalancers[?contains(LoadBalancerName,`rke2`)].{Name:LoadBalancerName,ARN:LoadBalancerArn,State:State.Code}' \
-            --output json
-          echo "=== TARGET GROUPS ==="
-          aws elbv2 describe-target-groups --region $AWS_REGION \
-            --query 'TargetGroups[].{Name:TargetGroupName,ARN:TargetGroupArn}' --output json
-          echo "=== SGs (non-default-VPC, non-default) ==="
-          aws ec2 describe-security-groups --region $AWS_REGION \
-            --query 'SecurityGroups[?GroupName!=`default` && VpcId!=`vpc-08750793f051e477b`].{ID:GroupId,Name:GroupName,VPC:VpcId}' \
-            --output json
-          echo "=== KEY PAIRS (rke2/calculator) ==="
-          aws ec2 describe-key-pairs --region $AWS_REGION \
-            --query 'KeyPairs[?contains(KeyName,`rke2`) || contains(KeyName,`calculator`)].{ID:KeyPairId,Name:KeyName}' \
-            --output json
-          echo "=== EBS (available) ==="
-          aws ec2 describe-volumes --region $AWS_REGION \
-            --filters "Name=status,Values=available" \
-            --query 'Volumes[].{ID:VolumeId,Size:Size,AZ:AvailabilityZone,Tags:Tags}' --output json
-          echo "=== EIPs (unassociated) ==="
-          aws ec2 describe-addresses --region $AWS_REGION \
-            --query 'Addresses[?!AssociationId].{AllocationId:AllocationId,PublicIP:PublicIp}' --output json
-          echo "=== IAM ROLES (rke2/calculator) ==="
-          aws iam list-roles \
-            --query 'Roles[?contains(RoleName,`rke2`) || contains(RoleName,`calculator`)].{Name:RoleName,ARN:Arn}' --output json
-          echo "=== VPCs (non-default) ==="
-          aws ec2 describe-vpcs --region $AWS_REGION \
-            --query 'Vpcs[?IsDefault==`false`].{ID:VpcId,CIDR:CidrBlock}' --output json
-          echo "=== S3 (calculator/rke2) ==="
-          aws s3api list-buckets \
-            --query 'Buckets[?contains(Name,`calculator`) || contains(Name,`rke2`)].{Name:Name}' --output json
-          echo "INVENTORY COMPLETE"
-
-      # ────────────────────────────────────────────────────────────────────
-      # TERMINATE EC2
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[terminate_ec2] Terminate rke2 instances"
-        if: env.EFFECTIVE_PHASE == 'terminate_ec2'
-        run: |
-          IDS="${{ inputs.instance_ids }}"
-          if [ -z "$IDS" ]; then
-            echo "Auto-discovering rke2-tagged instances..."
-            IDS=$(aws ec2 describe-instances \
-              --region $AWS_REGION \
-              --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-              --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`)].InstanceId' \
-              --output text)
-          fi
+            --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`) && VpcId!=`'"$DEFAULT_VPC"'`].InstanceId' \
+            --output text)
           echo "Instances to terminate: $IDS"
-          if [ -z "$IDS" ]; then echo "No rke2 instances found."; exit 0; fi
-          echo "=== PRE-TERMINATION STATE ==="
-          aws ec2 describe-instances --region $AWS_REGION --instance-ids $IDS \
-            --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Tags:Tags}' --output json
-          echo "=== TERMINATING ==="
-          aws ec2 terminate-instances --region $AWS_REGION --instance-ids $IDS --output json
-          echo "Termination initiated: $IDS"
-          echo "Live URL: ec2-terminating://$IDS"
-
-      # ────────────────────────────────────────────────────────────────────
-      # WAIT EC2 TERMINATED
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[wait_ec2_terminated] Wait for instances terminated"
-        if: env.EFFECTIVE_PHASE == 'wait_ec2_terminated'
-        run: |
-          IDS="${{ inputs.instance_ids }}"
           if [ -z "$IDS" ]; then
-            IDS=$(aws ec2 describe-instances \
-              --region $AWS_REGION \
-              --filters "Name=instance-state-name,Values=shutting-down,terminated" \
-              --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`)].InstanceId' \
-              --output text)
+            echo "No rke2 instances found — skipping termination."
+          else
+            aws ec2 describe-instances --region $AWS_REGION --instance-ids $IDS \
+              --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value}' \
+              --output json
+            echo "=== TERMINATING ==="
+            aws ec2 terminate-instances --region $AWS_REGION --instance-ids $IDS --output json
+            echo "Termination initiated for: $IDS"
           fi
-          echo "Waiting for: $IDS"
-          aws ec2 wait instance-terminated --region $AWS_REGION --instance-ids $IDS
-          aws ec2 describe-instances --region $AWS_REGION --instance-ids $IDS \
-            --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name}' --output json
-          echo "Live URL: ec2-terminated://confirmed"
 
-      # ────────────────────────────────────────────────────────────────────
-      # ALB CLEANUP
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[alb_cleanup] Delete listeners, ALB, target groups"
-        if: env.EFFECTIVE_PHASE == 'alb_cleanup'
+      # ── STEP 4: Wait for EC2 termination ────────────────────────────────
+      - name: "Step 4 — Wait for rke2 instances to reach terminated state"
         run: |
+          set -e
+          echo "=== DISCOVERING INSTANCES IN SHUTTING-DOWN OR TERMINATED STATE ==="
+          IDS=$(aws ec2 describe-instances \
+            --region $AWS_REGION \
+            --filters "Name=instance-state-name,Values=shutting-down,terminated" \
+            --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`)].InstanceId' \
+            --output text)
+          echo "Waiting on: $IDS"
+          if [ -z "$IDS" ]; then
+            echo "No rke2 instances in shutting-down/terminated state — nothing to wait for."
+          else
+            aws ec2 wait instance-terminated --region $AWS_REGION --instance-ids $IDS
+            echo "=== CONFIRMED TERMINATED ==="
+            aws ec2 describe-instances --region $AWS_REGION --instance-ids $IDS \
+              --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name}' --output json
+          fi
+
+      # ── STEP 5: ALB cleanup ──────────────────────────────────────────────
+      - name: "Step 5 — ALB cleanup (listeners → ALB → target groups)"
+        run: |
+          set -e
+          echo "=== DISCOVERING rke2-* ALBs ==="
           ALB_ARNS=$(aws elbv2 describe-load-balancers --region $AWS_REGION \
             --query 'LoadBalancers[?contains(LoadBalancerName,`rke2`)].LoadBalancerArn' --output text)
-          echo "ALB ARNs: $ALB_ARNS"
+          echo "ALB ARNs: ${ALB_ARNS:-none}"
           for ALB_ARN in $ALB_ARNS; do
+            echo "-- Processing ALB: $ALB_ARN --"
             LISTENER_ARNS=$(aws elbv2 describe-listeners --region $AWS_REGION \
               --load-balancer-arn $ALB_ARN --query 'Listeners[].ListenerArn' --output text)
             for LISTENER_ARN in $LISTENER_ARNS; do
-              aws elbv2 delete-listener --region $AWS_REGION --listener-arn $LISTENER_ARN
+              aws elbv2 delete-listener --region $AWS_REGION --listener-arn $LISTENER_ARN 2>/dev/null || true
               echo "DELETED listener: $LISTENER_ARN"
             done
-            aws elbv2 delete-load-balancer --region $AWS_REGION --load-balancer-arn $ALB_ARN
+            aws elbv2 delete-load-balancer --region $AWS_REGION --load-balancer-arn $ALB_ARN 2>/dev/null || true
             echo "DELETED ALB: $ALB_ARN"
           done
-          if [ -z "$ALB_ARNS" ]; then echo "No rke2-* ALBs found."; fi
-          echo "Waiting 30s for ALB deletion..."
+          echo "Sleeping 30s for ALB deletion to propagate..."
           sleep 30
+          echo "=== DISCOVERING rke2/ingress TARGET GROUPS ==="
           TG_ARNS=$(aws elbv2 describe-target-groups --region $AWS_REGION \
             --query 'TargetGroups[?contains(TargetGroupName,`ingress`) || contains(TargetGroupName,`rke2`)].TargetGroupArn' \
             --output text)
+          echo "TG ARNs: ${TG_ARNS:-none}"
           for TG_ARN in $TG_ARNS; do
-            aws elbv2 delete-target-group --region $AWS_REGION --target-group-arn $TG_ARN
-            echo "DELETED TG: $TG_ARN"
+            aws elbv2 delete-target-group --region $AWS_REGION --target-group-arn $TG_ARN 2>/dev/null || true
+            echo "DELETED target group: $TG_ARN"
           done
-          if [ -z "$TG_ARNS" ]; then echo "No rke2/ingress TGs found."; fi
-          echo "Live URL: alb-cleanup://complete"
 
-      # ────────────────────────────────────────────────────────────────────
-      # SG CLEANUP
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[sg_cleanup] Delete rke2-* SGs (skip default VPC)"
-        if: env.EFFECTIVE_PHASE == 'sg_cleanup'
+      # ── STEP 6: SG cleanup ───────────────────────────────────────────────
+      - name: "Step 6 — Security group cleanup (rke2-*, skip default VPC)"
         run: |
-          SG_IDS=$(aws ec2 describe-security-groups --region $AWS_REGION \
+          set -e
+          echo "=== DISCOVERING rke2-* SGs BY NAME ==="
+          NAME_SGS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=group-name,Values=rke2-*" \
-            --query 'SecurityGroups[?VpcId!=`vpc-08750793f051e477b` && GroupName!=`default`].GroupId' \
+            --query 'SecurityGroups[?VpcId!=`'"$DEFAULT_VPC"'` && GroupName!=`default`].GroupId' \
             --output text)
-          TAG_SG_IDS=$(aws ec2 describe-security-groups --region $AWS_REGION \
+          echo "=== DISCOVERING rke2-* SGs BY TAG ==="
+          TAG_SGS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=tag:Name,Values=rke2-*" \
-            --query 'SecurityGroups[?VpcId!=`vpc-08750793f051e477b` && GroupName!=`default`].GroupId' \
+            --query 'SecurityGroups[?VpcId!=`'"$DEFAULT_VPC"'` && GroupName!=`default`].GroupId' \
             --output text)
-          ALL_SGS=$(echo "$SG_IDS $TAG_SG_IDS" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
-          echo "SGs to delete: $ALL_SGS"
+          ALL_SGS=$(echo "$NAME_SGS $TAG_SGS" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
+          echo "SGs to delete: ${ALL_SGS:-none}"
           for SG_ID in $ALL_SGS; do
+            echo "-- Revoking rules on $SG_ID --"
             INGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
-              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json)
-            if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ]; then
+              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo '[]')
+            if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ] && [ "$INGRESS" != "null" ]; then
               aws ec2 revoke-security-group-ingress --region $AWS_REGION \
                 --group-id $SG_ID --ip-permissions "$INGRESS" 2>/dev/null || true
             fi
             EGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
-              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json)
-            if [ "$EGRESS" != "[]" ] && [ -n "$EGRESS" ]; then
+              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null || echo '[]')
+            if [ "$EGRESS" != "[]" ] && [ -n "$EGRESS" ] && [ "$EGRESS" != "null" ]; then
               aws ec2 revoke-security-group-egress --region $AWS_REGION \
                 --group-id $SG_ID --ip-permissions "$EGRESS" 2>/dev/null || true
             fi
-            aws ec2 delete-security-group --region $AWS_REGION --group-id $SG_ID
+            aws ec2 delete-security-group --region $AWS_REGION --group-id $SG_ID 2>/dev/null || true
             echo "DELETED SG: $SG_ID"
           done
-          if [ -z "$ALL_SGS" ]; then echo "No rke2-* SGs found."; fi
-          echo "Live URL: sg-cleanup://complete"
 
-      # ────────────────────────────────────────────────────────────────────
-      # KEY PAIR CLEANUP
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[keypair_cleanup] Delete rke2-* key pairs"
-        if: env.EFFECTIVE_PHASE == 'keypair_cleanup'
+      # ── STEP 7: Key pair cleanup ─────────────────────────────────────────
+      - name: "Step 7 — Key pair cleanup (rke2*)"
         run: |
+          set -e
+          echo "=== DISCOVERING rke2* KEY PAIRS ==="
           KP_NAMES=$(aws ec2 describe-key-pairs --region $AWS_REGION \
             --filters "Name=key-name,Values=rke2*" \
             --query 'KeyPairs[].KeyName' --output text)
-          echo "Key pairs: $KP_NAMES"
+          echo "Key pairs: ${KP_NAMES:-none}"
           for KP_NAME in $KP_NAMES; do
-            aws ec2 delete-key-pair --region $AWS_REGION --key-name $KP_NAME
+            aws ec2 delete-key-pair --region $AWS_REGION --key-name $KP_NAME 2>/dev/null || true
             echo "DELETED key pair: $KP_NAME"
           done
-          if [ -z "$KP_NAMES" ]; then echo "No rke2-* key pairs found."; fi
-          echo "Live URL: keypair-cleanup://complete"
 
-      # ────────────────────────────────────────────────────────────────────
-      # EBS CLEANUP
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[ebs_cleanup] Delete available EBS volumes (rke2-* or calculator-*)"
-        if: env.EFFECTIVE_PHASE == 'ebs_cleanup'
+      # ── STEP 8: EBS volume cleanup ───────────────────────────────────────
+      - name: "Step 8 — EBS volume cleanup (available, rke2-* or calculator-*)"
         run: |
-          echo "=== ALL AVAILABLE EBS ==="
+          set -e
+          echo "=== ALL AVAILABLE EBS VOLUMES ==="
           aws ec2 describe-volumes --region $AWS_REGION \
             --filters "Name=status,Values=available" \
             --query 'Volumes[].{ID:VolumeId,Size:Size,AZ:AvailabilityZone,Tags:Tags}' --output json
@@ -263,320 +185,348 @@ jobs:
             --filters "Name=status,Values=available" "Name=tag:Name,Values=calculator-*" \
             --query 'Volumes[].VolumeId' --output text)
           ALL_VOLS=$(echo "$RKE2_VOLS $CALC_VOLS" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
-          echo "Volumes to delete: $ALL_VOLS"
+          echo "Volumes to delete: ${ALL_VOLS:-none}"
           for VOL_ID in $ALL_VOLS; do
-            aws ec2 delete-volume --region $AWS_REGION --volume-id $VOL_ID
+            aws ec2 delete-volume --region $AWS_REGION --volume-id $VOL_ID 2>/dev/null || true
             echo "DELETED volume: $VOL_ID"
           done
-          if [ -z "$ALL_VOLS" ]; then echo "No tagged available EBS volumes found."; fi
-          echo "Live URL: ebs-cleanup://complete"
 
-      # ────────────────────────────────────────────────────────────────────
-      # EIP CLEANUP
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[eip_cleanup] Release unassociated EIPs"
-        if: env.EFFECTIVE_PHASE == 'eip_cleanup'
+      # ── STEP 9: EIP cleanup ──────────────────────────────────────────────
+      - name: "Step 9 — EIP cleanup (release all unassociated)"
         run: |
+          set -e
           echo "=== ALL EIPs ==="
           aws ec2 describe-addresses --region $AWS_REGION --output json
           ALLOC_IDS=$(aws ec2 describe-addresses --region $AWS_REGION \
             --query 'Addresses[?!AssociationId].AllocationId' --output text)
-          echo "Unassociated EIPs: $ALLOC_IDS"
+          echo "Unassociated EIPs: ${ALLOC_IDS:-none}"
           for ALLOC_ID in $ALLOC_IDS; do
-            aws ec2 release-address --region $AWS_REGION --allocation-id $ALLOC_ID
+            aws ec2 release-address --region $AWS_REGION --allocation-id $ALLOC_ID 2>/dev/null || true
             echo "RELEASED EIP: $ALLOC_ID"
           done
-          if [ -z "$ALLOC_IDS" ]; then echo "No unassociated EIPs."; fi
-          echo "Live URL: eip-cleanup://complete"
 
-      # ────────────────────────────────────────────────────────────────────
-      # IAM CLEANUP
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[iam_cleanup] Detach, inline-delete, profile-remove, delete IAM roles"
-        if: env.EFFECTIVE_PHASE == 'iam_cleanup'
+      # ── STEP 10: IAM cleanup ─────────────────────────────────────────────
+      - name: "Step 10 — IAM cleanup (rke2-*/calculator-* roles)"
         run: |
+          set -e
+          echo "=== DISCOVERING IAM ROLES ==="
           ROLES=$(aws iam list-roles \
             --query 'Roles[?contains(RoleName,`rke2`) || contains(RoleName,`calculator`)].RoleName' \
             --output text)
-          echo "Roles: $ROLES"
-          if [ -z "$ROLES" ]; then echo "No matching IAM roles."; fi
+          echo "Roles to clean up: ${ROLES:-none}"
           for ROLE in $ROLES; do
-            echo "=== Processing: $ROLE ==="
+            echo "=== Processing role: $ROLE ==="
             MANAGED=$(aws iam list-attached-role-policies --role-name $ROLE \
-              --query 'AttachedPolicies[].PolicyArn' --output text)
+              --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)
             for PA in $MANAGED; do
-              aws iam detach-role-policy --role-name $ROLE --policy-arn $PA
-              echo "  DETACHED: $PA"
+              aws iam detach-role-policy --role-name $ROLE --policy-arn $PA 2>/dev/null || true
+              echo "  DETACHED managed policy: $PA"
             done
             INLINE=$(aws iam list-role-policies --role-name $ROLE \
-              --query 'PolicyNames[]' --output text)
+              --query 'PolicyNames[]' --output text 2>/dev/null || true)
             for PN in $INLINE; do
-              aws iam delete-role-policy --role-name $ROLE --policy-name $PN
-              echo "  DELETED inline: $PN"
+              aws iam delete-role-policy --role-name $ROLE --policy-name $PN 2>/dev/null || true
+              echo "  DELETED inline policy: $PN"
             done
             PROFILES=$(aws iam list-instance-profiles-for-role --role-name $ROLE \
-              --query 'InstanceProfiles[].InstanceProfileName' --output text)
+              --query 'InstanceProfiles[].InstanceProfileName' --output text 2>/dev/null || true)
             for PFN in $PROFILES; do
-              aws iam remove-role-from-instance-profile --instance-profile-name $PFN --role-name $ROLE
-              echo "  REMOVED from profile: $PFN"
-              aws iam delete-instance-profile --instance-profile-name $PFN
-              echo "  DELETED profile: $PFN"
+              aws iam remove-role-from-instance-profile \
+                --instance-profile-name $PFN --role-name $ROLE 2>/dev/null || true
+              echo "  REMOVED from instance profile: $PFN"
+              aws iam delete-instance-profile --instance-profile-name $PFN 2>/dev/null || true
+              echo "  DELETED instance profile: $PFN"
             done
-            aws iam delete-role --role-name $ROLE
+            aws iam delete-role --role-name $ROLE 2>/dev/null || true
             echo "  DELETED ROLE: $ROLE"
           done
-          echo "Live URL: iam-cleanup://complete"
 
-      # ────────────────────────────────────────────────────────────────────
-      # VPC SUMMARY — gate check before VPC deletion
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[vpc_summary] Pre-VPC-deletion summary and gate inventory"
-        if: env.EFFECTIVE_PHASE == 'vpc_summary'
+      # ── STEP 11: VPC summary (read-only gate inventory) ──────────────────
+      - name: "Step 11 — VPC pre-deletion summary"
         run: |
-          echo "=== REMAINING EC2 ==="
-          aws ec2 describe-instances --region $AWS_REGION \
-            --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value}' --output json
-          echo "=== REMAINING ALBs ==="
-          aws elbv2 describe-load-balancers --region $AWS_REGION \
-            --query 'LoadBalancers[?contains(LoadBalancerName,`rke2`)].{Name:LoadBalancerName}' --output json
-          echo "=== REMAINING TGs ==="
-          aws elbv2 describe-target-groups --region $AWS_REGION \
-            --query 'TargetGroups[?contains(TargetGroupName,`ingress`) || contains(TargetGroupName,`rke2`)].{Name:TargetGroupName}' --output json
-          echo "=== REMAINING SGs (non-default-VPC) ==="
-          aws ec2 describe-security-groups --region $AWS_REGION \
-            --query 'SecurityGroups[?VpcId!=`vpc-08750793f051e477b`].{ID:GroupId,Name:GroupName,VPC:VpcId}' --output json
-          echo "=== REMAINING KEY PAIRS ==="
-          aws ec2 describe-key-pairs --region $AWS_REGION \
-            --filters "Name=key-name,Values=rke2*" --output json \
-            --query 'KeyPairs[].{Name:KeyName}'
-          echo "=== REMAINING EBS (available) ==="
-          aws ec2 describe-volumes --region $AWS_REGION \
-            --filters "Name=status,Values=available" \
-            --query 'Volumes[].{ID:VolumeId,Size:Size}' --output json
-          echo "=== REMAINING EIPs (unassociated) ==="
-          aws ec2 describe-addresses --region $AWS_REGION \
-            --query 'Addresses[?!AssociationId].{AllocationId:AllocationId,PublicIP:PublicIp}' --output json
-          echo "=== REMAINING IAM ROLES ==="
-          aws iam list-roles \
-            --query 'Roles[?contains(RoleName,`rke2`) || contains(RoleName,`calculator`)].RoleName' --output json
-          echo "=== VPC DETAIL (targets for deletion) ==="
-          for VPC_ID in vpc-044a1d577502cb21f vpc-06f8e83384de631d6 vpc-0818d68617434d141; do
-            echo "--- $VPC_ID ---"
+          set -e
+          echo "=== PRE-VPC-DELETION GATE SUMMARY ==="
+          echo "Default VPC (PROTECTED, NEVER TOUCHED): $DEFAULT_VPC"
+          echo ""
+          for VPC_ID in $VPC1 $VPC2 $VPC3; do
+            echo "────────────────────────────────────────"
+            echo "VPC: $VPC_ID"
             aws ec2 describe-vpcs --region $AWS_REGION --vpc-ids $VPC_ID \
-              --query 'Vpcs[0].{ID:VpcId,CIDR:CidrBlock}' --output json 2>/dev/null || echo "not found"
+              --query 'Vpcs[0].{ID:VpcId,CIDR:CidrBlock,IsDefault:IsDefault}' --output json 2>/dev/null || echo "  VPC not found"
+            echo "  Subnets:"
             aws ec2 describe-subnets --region $AWS_REGION \
               --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'Subnets[].{ID:SubnetId,CIDR:CidrBlock,AZ:AvailabilityZone}' --output json
+              --query 'Subnets[].{ID:SubnetId,CIDR:CidrBlock,AZ:AvailabilityZone}' --output json 2>/dev/null || true
+            echo "  Internet Gateways:"
             aws ec2 describe-internet-gateways --region $AWS_REGION \
               --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
-              --query 'InternetGateways[].InternetGatewayId' --output json
+              --query 'InternetGateways[].InternetGatewayId' --output json 2>/dev/null || true
+            echo "  Route Tables:"
             aws ec2 describe-route-tables --region $AWS_REGION \
               --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'RouteTables[].{ID:RouteTableId,Main:Associations[?Main==`true`]|[0].Main}' --output json
+              --query 'RouteTables[].{ID:RouteTableId,Main:Associations[?Main==`true`]|[0].Main}' --output json 2>/dev/null || true
+            echo "  Security Groups:"
             aws ec2 describe-security-groups --region $AWS_REGION \
               --filters "Name=vpc-id,Values=$VPC_ID" \
-              --query 'SecurityGroups[].{ID:GroupId,Name:GroupName}' --output json
+              --query 'SecurityGroups[].{ID:GroupId,Name:GroupName}' --output json 2>/dev/null || true
           done
-          echo "DEFAULT VPC (PROTECTED): vpc-08750793f051e477b"
-          echo "Live URL: vpc-summary://gate-ready"
+          echo "════════════════════════════════════════"
+          echo "Proceeding to VPC deletion..."
 
-      # ────────────────────────────────────────────────────────────────────
-      # VPC DELETE — vpc-044a1d577502cb21f
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[vpc_delete_044a1d577502cb21f] Delete VPC vpc-044a1d577502cb21f"
-        if: env.EFFECTIVE_PHASE == 'vpc_delete_044a1d577502cb21f'
+      # ── STEP 12: Delete VPC vpc-044a1d577502cb21f ────────────────────────
+      - name: "Step 12 — Delete VPC vpc-044a1d577502cb21f (10.0.0.0/16)"
         run: |
+          set -e
           VPC_ID="vpc-044a1d577502cb21f"
           echo "=== DELETING VPC: $VPC_ID ==="
+          echo "-- Non-default security groups --"
           SG_IDS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text)
+            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || true)
           for SG_ID in $SG_IDS; do
-            INGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json)
-            if [ "$INGRESS" != "[]" ]; then aws ec2 revoke-security-group-ingress --region $AWS_REGION --group-id $SG_ID --ip-permissions "$INGRESS" 2>/dev/null || true; fi
-            EGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json)
-            if [ "$EGRESS" != "[]" ]; then aws ec2 revoke-security-group-egress --region $AWS_REGION --group-id $SG_ID --ip-permissions "$EGRESS" 2>/dev/null || true; fi
-            aws ec2 delete-security-group --region $AWS_REGION --group-id $SG_ID && echo "DELETED SG: $SG_ID"
+            INGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
+              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo '[]')
+            if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ] && [ "$INGRESS" != "null" ]; then
+              aws ec2 revoke-security-group-ingress --region $AWS_REGION \
+                --group-id $SG_ID --ip-permissions "$INGRESS" 2>/dev/null || true
+            fi
+            EGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
+              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null || echo '[]')
+            if [ "$EGRESS" != "[]" ] && [ -n "$EGRESS" ] && [ "$EGRESS" != "null" ]; then
+              aws ec2 revoke-security-group-egress --region $AWS_REGION \
+                --group-id $SG_ID --ip-permissions "$EGRESS" 2>/dev/null || true
+            fi
+            aws ec2 delete-security-group --region $AWS_REGION --group-id $SG_ID 2>/dev/null || true
+            echo "DELETED SG: $SG_ID"
           done
+          echo "-- Subnets --"
           SUBNET_IDS=$(aws ec2 describe-subnets --region $AWS_REGION \
-            --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text)
+            --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text 2>/dev/null || true)
           for SUBNET_ID in $SUBNET_IDS; do
-            aws ec2 delete-subnet --region $AWS_REGION --subnet-id $SUBNET_ID && echo "DELETED subnet: $SUBNET_ID"
+            aws ec2 delete-subnet --region $AWS_REGION --subnet-id $SUBNET_ID 2>/dev/null || true
+            echo "DELETED subnet: $SUBNET_ID"
           done
+          echo "-- Internet gateways --"
           IGW_IDS=$(aws ec2 describe-internet-gateways --region $AWS_REGION \
             --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
-            --query 'InternetGateways[].InternetGatewayId' --output text)
+            --query 'InternetGateways[].InternetGatewayId' --output text 2>/dev/null || true)
           for IGW_ID in $IGW_IDS; do
-            aws ec2 detach-internet-gateway --region $AWS_REGION --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
-            aws ec2 delete-internet-gateway --region $AWS_REGION --internet-gateway-id $IGW_ID && echo "DELETED IGW: $IGW_ID"
+            aws ec2 detach-internet-gateway --region $AWS_REGION \
+              --internet-gateway-id $IGW_ID --vpc-id $VPC_ID 2>/dev/null || true
+            aws ec2 delete-internet-gateway --region $AWS_REGION \
+              --internet-gateway-id $IGW_ID 2>/dev/null || true
+            echo "DELETED IGW: $IGW_ID"
           done
+          echo "-- Non-main route tables --"
           RT_IDS=$(aws ec2 describe-route-tables --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' --output text)
+            --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' --output text 2>/dev/null || true)
           for RT_ID in $RT_IDS; do
-            aws ec2 delete-route-table --region $AWS_REGION --route-table-id $RT_ID && echo "DELETED RT: $RT_ID"
+            aws ec2 delete-route-table --region $AWS_REGION --route-table-id $RT_ID 2>/dev/null || true
+            echo "DELETED route table: $RT_ID"
           done
+          echo "-- Delete VPC --"
           aws ec2 delete-vpc --region $AWS_REGION --vpc-id $VPC_ID
           echo "DELETED VPC: $VPC_ID"
-          echo "Live URL: vpc-deleted://vpc-044a1d577502cb21f"
 
-      # ────────────────────────────────────────────────────────────────────
-      # VPC DELETE — vpc-06f8e83384de631d6
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[vpc_delete_06f8e83384de631d6] Delete VPC vpc-06f8e83384de631d6"
-        if: env.EFFECTIVE_PHASE == 'vpc_delete_06f8e83384de631d6'
+      # ── STEP 13: Delete VPC vpc-06f8e83384de631d6 ────────────────────────
+      - name: "Step 13 — Delete VPC vpc-06f8e83384de631d6 (10.0.0.0/16)"
         run: |
+          set -e
           VPC_ID="vpc-06f8e83384de631d6"
           echo "=== DELETING VPC: $VPC_ID ==="
+          echo "-- Non-default security groups --"
           SG_IDS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text)
+            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || true)
           for SG_ID in $SG_IDS; do
-            INGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json)
-            if [ "$INGRESS" != "[]" ]; then aws ec2 revoke-security-group-ingress --region $AWS_REGION --group-id $SG_ID --ip-permissions "$INGRESS" 2>/dev/null || true; fi
-            EGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json)
-            if [ "$EGRESS" != "[]" ]; then aws ec2 revoke-security-group-egress --region $AWS_REGION --group-id $SG_ID --ip-permissions "$EGRESS" 2>/dev/null || true; fi
-            aws ec2 delete-security-group --region $AWS_REGION --group-id $SG_ID && echo "DELETED SG: $SG_ID"
+            INGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
+              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo '[]')
+            if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ] && [ "$INGRESS" != "null" ]; then
+              aws ec2 revoke-security-group-ingress --region $AWS_REGION \
+                --group-id $SG_ID --ip-permissions "$INGRESS" 2>/dev/null || true
+            fi
+            EGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
+              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null || echo '[]')
+            if [ "$EGRESS" != "[]" ] && [ -n "$EGRESS" ] && [ "$EGRESS" != "null" ]; then
+              aws ec2 revoke-security-group-egress --region $AWS_REGION \
+                --group-id $SG_ID --ip-permissions "$EGRESS" 2>/dev/null || true
+            fi
+            aws ec2 delete-security-group --region $AWS_REGION --group-id $SG_ID 2>/dev/null || true
+            echo "DELETED SG: $SG_ID"
           done
+          echo "-- Subnets --"
           SUBNET_IDS=$(aws ec2 describe-subnets --region $AWS_REGION \
-            --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text)
+            --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text 2>/dev/null || true)
           for SUBNET_ID in $SUBNET_IDS; do
-            aws ec2 delete-subnet --region $AWS_REGION --subnet-id $SUBNET_ID && echo "DELETED subnet: $SUBNET_ID"
+            aws ec2 delete-subnet --region $AWS_REGION --subnet-id $SUBNET_ID 2>/dev/null || true
+            echo "DELETED subnet: $SUBNET_ID"
           done
+          echo "-- Internet gateways --"
           IGW_IDS=$(aws ec2 describe-internet-gateways --region $AWS_REGION \
             --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
-            --query 'InternetGateways[].InternetGatewayId' --output text)
+            --query 'InternetGateways[].InternetGatewayId' --output text 2>/dev/null || true)
           for IGW_ID in $IGW_IDS; do
-            aws ec2 detach-internet-gateway --region $AWS_REGION --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
-            aws ec2 delete-internet-gateway --region $AWS_REGION --internet-gateway-id $IGW_ID && echo "DELETED IGW: $IGW_ID"
+            aws ec2 detach-internet-gateway --region $AWS_REGION \
+              --internet-gateway-id $IGW_ID --vpc-id $VPC_ID 2>/dev/null || true
+            aws ec2 delete-internet-gateway --region $AWS_REGION \
+              --internet-gateway-id $IGW_ID 2>/dev/null || true
+            echo "DELETED IGW: $IGW_ID"
           done
+          echo "-- Non-main route tables --"
           RT_IDS=$(aws ec2 describe-route-tables --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' --output text)
+            --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' --output text 2>/dev/null || true)
           for RT_ID in $RT_IDS; do
-            aws ec2 delete-route-table --region $AWS_REGION --route-table-id $RT_ID && echo "DELETED RT: $RT_ID"
+            aws ec2 delete-route-table --region $AWS_REGION --route-table-id $RT_ID 2>/dev/null || true
+            echo "DELETED route table: $RT_ID"
           done
+          echo "-- Delete VPC --"
           aws ec2 delete-vpc --region $AWS_REGION --vpc-id $VPC_ID
           echo "DELETED VPC: $VPC_ID"
-          echo "Live URL: vpc-deleted://vpc-06f8e83384de631d6"
 
-      # ────────────────────────────────────────────────────────────────────
-      # VPC DELETE — vpc-0818d68617434d141
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[vpc_delete_0818d68617434d141] Delete VPC vpc-0818d68617434d141"
-        if: env.EFFECTIVE_PHASE == 'vpc_delete_0818d68617434d141'
+      # ── STEP 14: Delete VPC vpc-0818d68617434d141 ────────────────────────
+      - name: "Step 14 — Delete VPC vpc-0818d68617434d141 (10.42.0.0/16)"
         run: |
+          set -e
           VPC_ID="vpc-0818d68617434d141"
           echo "=== DELETING VPC: $VPC_ID ==="
+          echo "-- Non-default security groups --"
           SG_IDS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text)
+            --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || true)
           for SG_ID in $SG_IDS; do
-            INGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json)
-            if [ "$INGRESS" != "[]" ]; then aws ec2 revoke-security-group-ingress --region $AWS_REGION --group-id $SG_ID --ip-permissions "$INGRESS" 2>/dev/null || true; fi
-            EGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json)
-            if [ "$EGRESS" != "[]" ]; then aws ec2 revoke-security-group-egress --region $AWS_REGION --group-id $SG_ID --ip-permissions "$EGRESS" 2>/dev/null || true; fi
-            aws ec2 delete-security-group --region $AWS_REGION --group-id $SG_ID && echo "DELETED SG: $SG_ID"
+            INGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
+              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo '[]')
+            if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ] && [ "$INGRESS" != "null" ]; then
+              aws ec2 revoke-security-group-ingress --region $AWS_REGION \
+                --group-id $SG_ID --ip-permissions "$INGRESS" 2>/dev/null || true
+            fi
+            EGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
+              --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissionsEgress' --output json 2>/dev/null || echo '[]')
+            if [ "$EGRESS" != "[]" ] && [ -n "$EGRESS" ] && [ "$EGRESS" != "null" ]; then
+              aws ec2 revoke-security-group-egress --region $AWS_REGION \
+                --group-id $SG_ID --ip-permissions "$EGRESS" 2>/dev/null || true
+            fi
+            aws ec2 delete-security-group --region $AWS_REGION --group-id $SG_ID 2>/dev/null || true
+            echo "DELETED SG: $SG_ID"
           done
+          echo "-- Subnets --"
           SUBNET_IDS=$(aws ec2 describe-subnets --region $AWS_REGION \
-            --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text)
+            --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text 2>/dev/null || true)
           for SUBNET_ID in $SUBNET_IDS; do
-            aws ec2 delete-subnet --region $AWS_REGION --subnet-id $SUBNET_ID && echo "DELETED subnet: $SUBNET_ID"
+            aws ec2 delete-subnet --region $AWS_REGION --subnet-id $SUBNET_ID 2>/dev/null || true
+            echo "DELETED subnet: $SUBNET_ID"
           done
+          echo "-- Internet gateways --"
           IGW_IDS=$(aws ec2 describe-internet-gateways --region $AWS_REGION \
             --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
-            --query 'InternetGateways[].InternetGatewayId' --output text)
+            --query 'InternetGateways[].InternetGatewayId' --output text 2>/dev/null || true)
           for IGW_ID in $IGW_IDS; do
-            aws ec2 detach-internet-gateway --region $AWS_REGION --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
-            aws ec2 delete-internet-gateway --region $AWS_REGION --internet-gateway-id $IGW_ID && echo "DELETED IGW: $IGW_ID"
+            aws ec2 detach-internet-gateway --region $AWS_REGION \
+              --internet-gateway-id $IGW_ID --vpc-id $VPC_ID 2>/dev/null || true
+            aws ec2 delete-internet-gateway --region $AWS_REGION \
+              --internet-gateway-id $IGW_ID 2>/dev/null || true
+            echo "DELETED IGW: $IGW_ID"
           done
+          echo "-- Non-main route tables --"
           RT_IDS=$(aws ec2 describe-route-tables --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' --output text)
+            --query 'RouteTables[?!Associations[?Main==`true`]].RouteTableId' --output text 2>/dev/null || true)
           for RT_ID in $RT_IDS; do
-            aws ec2 delete-route-table --region $AWS_REGION --route-table-id $RT_ID && echo "DELETED RT: $RT_ID"
+            aws ec2 delete-route-table --region $AWS_REGION --route-table-id $RT_ID 2>/dev/null || true
+            echo "DELETED route table: $RT_ID"
           done
+          echo "-- Delete VPC --"
           aws ec2 delete-vpc --region $AWS_REGION --vpc-id $VPC_ID
           echo "DELETED VPC: $VPC_ID"
-          echo "Live URL: vpc-deleted://vpc-0818d68617434d141"
 
-      # ────────────────────────────────────────────────────────────────────
-      # S3 CLEANUP
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[s3_cleanup] Empty and delete udap-calculator-tf-state-a7f3k9"
-        if: env.EFFECTIVE_PHASE == 's3_cleanup'
+      # ── STEP 15: S3 cleanup ──────────────────────────────────────────────
+      - name: "Step 15 — S3 cleanup (empty and delete udap-calculator-tf-state-a7f3k9)"
         run: |
+          set -e
           BUCKET="udap-calculator-tf-state-a7f3k9"
           echo "=== S3 BUCKET: $BUCKET ==="
-          aws s3api get-bucket-versioning --bucket $BUCKET
-          echo "-- Deleting object versions --"
+          aws s3api get-bucket-versioning --bucket $BUCKET 2>/dev/null || echo "Bucket may not exist"
+          echo "-- Deleting object versions in batches --"
           while true; do
             VERSIONS=$(aws s3api list-object-versions \
               --bucket $BUCKET --max-items 1000 \
-              --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' --output json 2>/dev/null)
+              --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+              --output json 2>/dev/null || echo '{"Objects":null}')
             COUNT=$(echo "$VERSIONS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('Objects') or []))" 2>/dev/null || echo 0)
-            echo "Version batch: $COUNT"
+            echo "Version batch count: $COUNT"
             if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then break; fi
             aws s3api delete-objects --bucket $BUCKET --delete "$VERSIONS" --output json
-            echo "  Deleted $COUNT versions."
+            echo "  Deleted $COUNT object versions."
           done
-          echo "-- Deleting delete markers --"
+          echo "-- Deleting delete markers in batches --"
           while true; do
             MARKERS=$(aws s3api list-object-versions \
               --bucket $BUCKET --max-items 1000 \
-              --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' --output json 2>/dev/null)
+              --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+              --output json 2>/dev/null || echo '{"Objects":null}')
             COUNT=$(echo "$MARKERS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('Objects') or []))" 2>/dev/null || echo 0)
-            echo "Delete marker batch: $COUNT"
+            echo "Delete marker batch count: $COUNT"
             if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then break; fi
             aws s3api delete-objects --bucket $BUCKET --delete "$MARKERS" --output json
-            echo "  Deleted $COUNT markers."
+            echo "  Deleted $COUNT delete markers."
           done
-          echo "-- Verifying empty --"
-          aws s3api list-object-versions --bucket $BUCKET --output json
+          echo "-- Verifying bucket is empty --"
+          aws s3api list-object-versions --bucket $BUCKET --output json 2>/dev/null || true
           echo "-- Deleting bucket --"
           aws s3api delete-bucket --bucket $BUCKET --region $AWS_REGION
           echo "DELETED BUCKET: $BUCKET"
-          echo "Live URL: s3-deleted://udap-calculator-tf-state-a7f3k9"
 
-      # ────────────────────────────────────────────────────────────────────
-      # FINAL SWEEP
-      # ────────────────────────────────────────────────────────────────────
-      - name: "[final_sweep] Confirm zero orphaned resources"
-        if: env.EFFECTIVE_PHASE == 'final_sweep'
+      # ── STEP 16: Final sweep ─────────────────────────────────────────────
+      - name: "Step 16 — Final sweep (confirm zero orphaned resources)"
         run: |
           echo "=== FINAL SWEEP ==="
-          echo "--- EC2 (non-terminated rke2/calculator) ---"
+          echo "--- EC2 (non-terminated, rke2/calculator tagged) ---"
           aws ec2 describe-instances --region $AWS_REGION \
             --filters "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`) || contains(Tags[?Key==`Name`]|[0].Value,`calculator`)].{ID:InstanceId,State:State.Name}' --output json
-          echo "--- ALBs (rke2) ---"
+            --query 'Reservations[].Instances[?contains(Tags[?Key==`Name`]|[0].Value,`rke2`) || contains(Tags[?Key==`Name`]|[0].Value,`calculator`)].{ID:InstanceId,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value}' \
+            --output json 2>/dev/null || echo "[]"
+          echo "--- ALBs (rke2-*) ---"
           aws elbv2 describe-load-balancers --region $AWS_REGION \
-            --query 'LoadBalancers[?contains(LoadBalancerName,`rke2`)].{Name:LoadBalancerName}' --output json
-          echo "--- TGs (rke2/ingress) ---"
+            --query 'LoadBalancers[?contains(LoadBalancerName,`rke2`)].{Name:LoadBalancerName,ARN:LoadBalancerArn}' \
+            --output json 2>/dev/null || echo "[]"
+          echo "--- Target groups (rke2/ingress) ---"
           aws elbv2 describe-target-groups --region $AWS_REGION \
-            --query 'TargetGroups[?contains(TargetGroupName,`rke2`) || contains(TargetGroupName,`ingress`)].{Name:TargetGroupName}' --output json
-          echo "--- SGs (non-default-VPC) ---"
+            --query 'TargetGroups[?contains(TargetGroupName,`rke2`) || contains(TargetGroupName,`ingress`)].{Name:TargetGroupName}' \
+            --output json 2>/dev/null || echo "[]"
+          echo "--- Security groups (non-default VPC, non-default named) ---"
           aws ec2 describe-security-groups --region $AWS_REGION \
-            --query 'SecurityGroups[?VpcId!=`vpc-08750793f051e477b`].{ID:GroupId,Name:GroupName,VPC:VpcId}' --output json
+            --query 'SecurityGroups[?VpcId!=`'"$DEFAULT_VPC"'` && GroupName!=`default`].{ID:GroupId,Name:GroupName,VPC:VpcId}' \
+            --output json 2>/dev/null || echo "[]"
           echo "--- Key pairs (rke2*) ---"
           aws ec2 describe-key-pairs --region $AWS_REGION \
-            --filters "Name=key-name,Values=rke2*" --query 'KeyPairs[].KeyName' --output json
-          echo "--- Available EBS ---"
+            --filters "Name=key-name,Values=rke2*" \
+            --query 'KeyPairs[].KeyName' --output json 2>/dev/null || echo "[]"
+          echo "--- Available EBS volumes ---"
           aws ec2 describe-volumes --region $AWS_REGION \
             --filters "Name=status,Values=available" \
-            --query 'Volumes[].{ID:VolumeId,Size:Size}' --output json
+            --query 'Volumes[].{ID:VolumeId,Size:Size,Tags:Tags}' \
+            --output json 2>/dev/null || echo "[]"
           echo "--- Unassociated EIPs ---"
           aws ec2 describe-addresses --region $AWS_REGION \
-            --query 'Addresses[?!AssociationId].{AllocationId:AllocationId,PublicIP:PublicIp}' --output json
+            --query 'Addresses[?!AssociationId].{AllocationId:AllocationId,PublicIP:PublicIp}' \
+            --output json 2>/dev/null || echo "[]"
           echo "--- IAM roles (rke2/calculator) ---"
           aws iam list-roles \
-            --query 'Roles[?contains(RoleName,`rke2`) || contains(RoleName,`calculator`)].RoleName' --output json
-          echo "--- VPCs ---"
+            --query 'Roles[?contains(RoleName,`rke2`) || contains(RoleName,`calculator`)].RoleName' \
+            --output json 2>/dev/null || echo "[]"
+          echo "--- ALL VPCs (expect only default vpc-08750793f051e477b) ---"
           aws ec2 describe-vpcs --region $AWS_REGION \
-            --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock,IsDefault:IsDefault}' --output json
-          echo "--- S3 (calculator/rke2) ---"
+            --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock,IsDefault:IsDefault}' \
+            --output json 2>/dev/null || echo "[]"
+          echo "--- VPC count ---"
+          VPC_COUNT=$(aws ec2 describe-vpcs --region $AWS_REGION \
+            --query 'length(Vpcs)' --output text 2>/dev/null || echo "unknown")
+          echo "Total VPC count: $VPC_COUNT (expected: 1)"
+          echo "--- S3 buckets (calculator/rke2) ---"
           aws s3api list-buckets \
-            --query 'Buckets[?contains(Name,`calculator`) || contains(Name,`rke2`)].{Name:Name}' --output json
+            --query 'Buckets[?contains(Name,`calculator`) || contains(Name,`rke2`)].{Name:Name}' \
+            --output json 2>/dev/null || echo "[]"
           echo "=== SWEEP COMPLETE ==="
-          echo "Live URL: final-sweep://complete"
+          echo "Live URL: cleanup://complete"
