@@ -50,11 +50,10 @@ jobs:
             --output json
 
       # ── STEP 3: Terminate rke2 EC2 instances ────────────────────────────
-      # AWS-side tag filter avoids JMESPath contains(null) on tagless instances
       - name: "Step 3 — Terminate rke2 EC2 instances"
         run: |
           set -e
-          echo "=== AUTO-DISCOVERING rke2 INSTANCES BY Name TAG (AWS filter) ==="
+          echo "=== AUTO-DISCOVERING rke2 INSTANCES BY Name TAG ==="
           IDS=$(aws ec2 describe-instances \
             --region $AWS_REGION \
             --filters \
@@ -64,7 +63,7 @@ jobs:
             --output text)
           echo "Instances to terminate: ${IDS:-none}"
           if [ -z "$IDS" ]; then
-            echo "No rke2 instances found — skipping termination."
+            echo "No rke2 instances found — skipping."
           else
             echo "=== PRE-TERMINATION STATE ==="
             aws ec2 describe-instances --region $AWS_REGION --instance-ids $IDS \
@@ -79,7 +78,6 @@ jobs:
       - name: "Step 4 — Wait for rke2 instances to reach terminated state"
         run: |
           set -e
-          echo "=== DISCOVERING rke2 INSTANCES IN shutting-down OR terminated STATE ==="
           IDS=$(aws ec2 describe-instances \
             --region $AWS_REGION \
             --filters \
@@ -89,7 +87,7 @@ jobs:
             --output text)
           echo "Waiting on: ${IDS:-none}"
           if [ -z "$IDS" ]; then
-            echo "No rke2 instances in shutting-down/terminated state — nothing to wait for."
+            echo "Nothing to wait for."
           else
             aws ec2 wait instance-terminated --region $AWS_REGION --instance-ids $IDS
             echo "=== CONFIRMED TERMINATED ==="
@@ -101,12 +99,10 @@ jobs:
       - name: "Step 5 — ALB cleanup (listeners → ALB → target groups)"
         run: |
           set -e
-          echo "=== DISCOVERING rke2-* ALBs ==="
           ALB_ARNS=$(aws elbv2 describe-load-balancers --region $AWS_REGION \
             --query 'LoadBalancers[?contains(LoadBalancerName,`rke2`)].LoadBalancerArn' --output text)
           echo "ALB ARNs: ${ALB_ARNS:-none}"
           for ALB_ARN in $ALB_ARNS; do
-            echo "-- Processing ALB: $ALB_ARN --"
             LISTENER_ARNS=$(aws elbv2 describe-listeners --region $AWS_REGION \
               --load-balancer-arn $ALB_ARN --query 'Listeners[].ListenerArn' --output text)
             for LISTENER_ARN in $LISTENER_ARNS; do
@@ -116,9 +112,8 @@ jobs:
             aws elbv2 delete-load-balancer --region $AWS_REGION --load-balancer-arn $ALB_ARN 2>/dev/null || true
             echo "DELETED ALB: $ALB_ARN"
           done
-          echo "Sleeping 30s for ALB deletion to propagate..."
+          echo "Sleeping 30s for ALB deletion..."
           sleep 30
-          echo "=== DISCOVERING rke2/ingress TARGET GROUPS ==="
           TG_ARNS=$(aws elbv2 describe-target-groups --region $AWS_REGION \
             --query 'TargetGroups[?contains(TargetGroupName,`ingress`) || contains(TargetGroupName,`rke2`)].TargetGroupArn' \
             --output text)
@@ -132,12 +127,10 @@ jobs:
       - name: "Step 6 — Security group cleanup (rke2-*, skip default VPC)"
         run: |
           set -e
-          echo "=== DISCOVERING rke2-* SGs BY NAME ==="
           NAME_SGS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=group-name,Values=rke2-*" \
             --query 'SecurityGroups[?VpcId!=`'"$DEFAULT_VPC"'` && GroupName!=`default`].GroupId' \
             --output text)
-          echo "=== DISCOVERING rke2-* SGs BY TAG ==="
           TAG_SGS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=tag:Name,Values=rke2-*" \
             --query 'SecurityGroups[?VpcId!=`'"$DEFAULT_VPC"'` && GroupName!=`default`].GroupId' \
@@ -145,7 +138,6 @@ jobs:
           ALL_SGS=$(echo "$NAME_SGS $TAG_SGS" | tr ' ' '\n' | sort -u | grep -v '^$' | tr '\n' ' ')
           echo "SGs to delete: ${ALL_SGS:-none}"
           for SG_ID in $ALL_SGS; do
-            echo "-- Revoking rules on $SG_ID --"
             INGRESS=$(aws ec2 describe-security-groups --region $AWS_REGION \
               --group-ids $SG_ID --query 'SecurityGroups[0].IpPermissions' --output json 2>/dev/null || echo '[]')
             if [ "$INGRESS" != "[]" ] && [ -n "$INGRESS" ] && [ "$INGRESS" != "null" ]; then
@@ -166,7 +158,6 @@ jobs:
       - name: "Step 7 — Key pair cleanup (rke2*)"
         run: |
           set -e
-          echo "=== DISCOVERING rke2* KEY PAIRS ==="
           KP_NAMES=$(aws ec2 describe-key-pairs --region $AWS_REGION \
             --filters "Name=key-name,Values=rke2*" \
             --query 'KeyPairs[].KeyName' --output text)
@@ -180,7 +171,7 @@ jobs:
       - name: "Step 8 — EBS volume cleanup (available, rke2-* or calculator-*)"
         run: |
           set -e
-          echo "=== ALL AVAILABLE EBS VOLUMES ==="
+          echo "=== ALL AVAILABLE EBS ==="
           aws ec2 describe-volumes --region $AWS_REGION \
             --filters "Name=status,Values=available" \
             --query 'Volumes[].{ID:VolumeId,Size:Size,AZ:AvailabilityZone,Tags:Tags}' --output json
@@ -215,76 +206,77 @@ jobs:
       - name: "Step 10 — IAM cleanup (rke2-*/calculator-* roles)"
         run: |
           set -e
-          echo "=== DISCOVERING IAM ROLES ==="
           ROLES=$(aws iam list-roles \
             --query 'Roles[?contains(RoleName,`rke2`) || contains(RoleName,`calculator`)].RoleName' \
             --output text)
-          echo "Roles to clean up: ${ROLES:-none}"
+          echo "Roles: ${ROLES:-none}"
           for ROLE in $ROLES; do
-            echo "=== Processing role: $ROLE ==="
+            echo "=== Processing: $ROLE ==="
             MANAGED=$(aws iam list-attached-role-policies --role-name $ROLE \
               --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null || true)
             for PA in $MANAGED; do
               aws iam detach-role-policy --role-name $ROLE --policy-arn $PA 2>/dev/null || true
-              echo "  DETACHED managed policy: $PA"
+              echo "  DETACHED: $PA"
             done
             INLINE=$(aws iam list-role-policies --role-name $ROLE \
               --query 'PolicyNames[]' --output text 2>/dev/null || true)
             for PN in $INLINE; do
               aws iam delete-role-policy --role-name $ROLE --policy-name $PN 2>/dev/null || true
-              echo "  DELETED inline policy: $PN"
+              echo "  DELETED inline: $PN"
             done
             PROFILES=$(aws iam list-instance-profiles-for-role --role-name $ROLE \
               --query 'InstanceProfiles[].InstanceProfileName' --output text 2>/dev/null || true)
             for PFN in $PROFILES; do
               aws iam remove-role-from-instance-profile \
                 --instance-profile-name $PFN --role-name $ROLE 2>/dev/null || true
-              echo "  REMOVED from instance profile: $PFN"
               aws iam delete-instance-profile --instance-profile-name $PFN 2>/dev/null || true
-              echo "  DELETED instance profile: $PFN"
+              echo "  DELETED profile: $PFN"
             done
             aws iam delete-role --role-name $ROLE 2>/dev/null || true
             echo "  DELETED ROLE: $ROLE"
           done
 
-      # ── STEP 11: VPC summary (read-only gate inventory) ──────────────────
+      # ── STEP 11: VPC summary ─────────────────────────────────────────────
       - name: "Step 11 — VPC pre-deletion summary"
         run: |
-          set -e
-          echo "=== PRE-VPC-DELETION GATE SUMMARY ==="
-          echo "Default VPC (PROTECTED, NEVER TOUCHED): $DEFAULT_VPC"
-          echo ""
+          echo "=== PRE-VPC-DELETION SUMMARY ==="
+          echo "Default VPC (PROTECTED): $DEFAULT_VPC"
           for VPC_ID in $VPC1 $VPC2 $VPC3; do
-            echo "────────────────────────────────────────"
-            echo "VPC: $VPC_ID"
+            echo "──── VPC: $VPC_ID ────"
             aws ec2 describe-vpcs --region $AWS_REGION --vpc-ids $VPC_ID \
-              --query 'Vpcs[0].{ID:VpcId,CIDR:CidrBlock,IsDefault:IsDefault}' --output json 2>/dev/null || echo "  VPC not found"
-            echo "  Subnets:"
+              --query 'Vpcs[0].{ID:VpcId,CIDR:CidrBlock}' --output json 2>/dev/null || echo "not found"
+            echo "Subnets:"
             aws ec2 describe-subnets --region $AWS_REGION \
               --filters "Name=vpc-id,Values=$VPC_ID" \
               --query 'Subnets[].{ID:SubnetId,CIDR:CidrBlock,AZ:AvailabilityZone}' --output json 2>/dev/null || true
-            echo "  Internet Gateways:"
+            echo "IGWs:"
             aws ec2 describe-internet-gateways --region $AWS_REGION \
               --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
               --query 'InternetGateways[].InternetGatewayId' --output json 2>/dev/null || true
-            echo "  Route Tables:"
+            echo "Route tables:"
             aws ec2 describe-route-tables --region $AWS_REGION \
               --filters "Name=vpc-id,Values=$VPC_ID" \
               --query 'RouteTables[].{ID:RouteTableId,Main:Associations[?Main==`true`]|[0].Main}' --output json 2>/dev/null || true
-            echo "  Security Groups:"
+            echo "SGs:"
             aws ec2 describe-security-groups --region $AWS_REGION \
               --filters "Name=vpc-id,Values=$VPC_ID" \
               --query 'SecurityGroups[].{ID:GroupId,Name:GroupName}' --output json 2>/dev/null || true
-            echo "  ENIs:"
+            echo "ENIs:"
             aws ec2 describe-network-interfaces --region $AWS_REGION \
               --filters "Name=vpc-id,Values=$VPC_ID" \
               --query 'NetworkInterfaces[].{ID:NetworkInterfaceId,Status:Status,Description:Description}' --output json 2>/dev/null || true
+            echo "VPC Endpoints:"
+            aws ec2 describe-vpc-endpoints --region $AWS_REGION \
+              --filters "Name=vpc-id,Values=$VPC_ID" \
+              --query 'VpcEndpoints[?State!=`deleted`].{ID:VpcEndpointId,Service:ServiceName,State:State}' --output json 2>/dev/null || true
+            echo "Peering connections:"
+            aws ec2 describe-vpc-peering-connections --region $AWS_REGION \
+              --filters "Name=requester-vpc-info.vpc-id,Values=$VPC_ID" \
+              --query 'VpcPeeringConnections[].VpcPeeringConnectionId' --output json 2>/dev/null || true
           done
-          echo "════════════════════════════════════════"
-          echo "Proceeding to VPC deletion..."
 
-      # ── Helper function — shared VPC delete logic ────────────────────────
-      # Inlined per VPC below (GitHub Actions does not support shell functions across steps)
+      # ── VPC DELETE HELPER — shared bash function via sourced file ─────────
+      # Inlined in each step below.
 
       # ── STEP 12: Delete VPC vpc-044a1d577502cb21f ────────────────────────
       - name: "Step 12 — Delete VPC vpc-044a1d577502cb21f (10.0.0.0/16)"
@@ -293,7 +285,29 @@ jobs:
           VPC_ID="vpc-044a1d577502cb21f"
           echo "=== DELETING VPC: $VPC_ID ==="
 
-          echo "-- Non-default security groups: revoke rules then delete --"
+          # 1. VPC endpoints
+          echo "-- VPC endpoints --"
+          EP_IDS=$(aws ec2 describe-vpc-endpoints --region $AWS_REGION \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'VpcEndpoints[?State!=`deleted`].VpcEndpointId' --output text 2>/dev/null || true)
+          for EP_ID in $EP_IDS; do
+            aws ec2 delete-vpc-endpoints --region $AWS_REGION --vpc-endpoint-ids $EP_ID 2>/dev/null || true
+            echo "DELETED VPC endpoint: $EP_ID"
+          done
+
+          # 2. Peering connections
+          echo "-- Peering connections --"
+          PEER_IDS=$(aws ec2 describe-vpc-peering-connections --region $AWS_REGION \
+            --filters "Name=requester-vpc-info.vpc-id,Values=$VPC_ID" \
+            --query 'VpcPeeringConnections[].VpcPeeringConnectionId' --output text 2>/dev/null || true)
+          for PEER_ID in $PEER_IDS; do
+            aws ec2 delete-vpc-peering-connection --region $AWS_REGION \
+              --vpc-peering-connection-id $PEER_ID 2>/dev/null || true
+            echo "DELETED peering: $PEER_ID"
+          done
+
+          # 3. Non-default SGs (revoke rules first)
+          echo "-- Non-default SGs --"
           SG_IDS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || true)
@@ -314,6 +328,7 @@ jobs:
             echo "DELETED SG: $SG_ID"
           done
 
+          # 4. Subnets
           echo "-- Subnets --"
           SUBNET_IDS=$(aws ec2 describe-subnets --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" --query 'Subnets[].SubnetId' --output text 2>/dev/null || true)
@@ -322,6 +337,7 @@ jobs:
             echo "DELETED subnet: $SUBNET_ID"
           done
 
+          # 5. IGWs
           echo "-- Internet gateways --"
           IGW_IDS=$(aws ec2 describe-internet-gateways --region $AWS_REGION \
             --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
@@ -334,6 +350,7 @@ jobs:
             echo "DELETED IGW: $IGW_ID"
           done
 
+          # 6. Non-main route tables
           echo "-- Non-main route tables --"
           RT_IDS=$(aws ec2 describe-route-tables --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
@@ -343,15 +360,33 @@ jobs:
             echo "DELETED route table: $RT_ID"
           done
 
-          echo "-- Orphaned ENIs (left by ALB/EKS/etc) --"
+          # 7. ALL ENIs (any status — force delete orphans from EKS/ALB)
+          echo "-- All ENIs in VPC (any status) --"
           ENI_IDS=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'NetworkInterfaces[?Status!=`in-use`].NetworkInterfaceId' --output text 2>/dev/null || true)
+            --query 'NetworkInterfaces[].NetworkInterfaceId' --output text 2>/dev/null || true)
           for ENI_ID in $ENI_IDS; do
+            # Disassociate from any EIP first
+            ASSOC_ID=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
+              --network-interface-ids $ENI_ID \
+              --query 'NetworkInterfaces[0].Association.AssociationId' --output text 2>/dev/null || true)
+            if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ] && [ "$ASSOC_ID" != "null" ]; then
+              aws ec2 disassociate-address --region $AWS_REGION --association-id $ASSOC_ID 2>/dev/null || true
+            fi
+            # Detach if attached
+            ATTACH_ID=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
+              --network-interface-ids $ENI_ID \
+              --query 'NetworkInterfaces[0].Attachment.AttachmentId' --output text 2>/dev/null || true)
+            if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ] && [ "$ATTACH_ID" != "null" ]; then
+              aws ec2 detach-network-interface --region $AWS_REGION \
+                --attachment-id $ATTACH_ID --force 2>/dev/null || true
+              sleep 3
+            fi
             aws ec2 delete-network-interface --region $AWS_REGION --network-interface-id $ENI_ID 2>/dev/null || true
             echo "DELETED ENI: $ENI_ID"
           done
 
+          # 8. Delete VPC
           echo "-- Delete VPC --"
           aws ec2 delete-vpc --region $AWS_REGION --vpc-id $VPC_ID
           echo "DELETED VPC: $VPC_ID"
@@ -363,7 +398,26 @@ jobs:
           VPC_ID="vpc-06f8e83384de631d6"
           echo "=== DELETING VPC: $VPC_ID ==="
 
-          echo "-- Non-default security groups: revoke rules then delete --"
+          echo "-- VPC endpoints --"
+          EP_IDS=$(aws ec2 describe-vpc-endpoints --region $AWS_REGION \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'VpcEndpoints[?State!=`deleted`].VpcEndpointId' --output text 2>/dev/null || true)
+          for EP_ID in $EP_IDS; do
+            aws ec2 delete-vpc-endpoints --region $AWS_REGION --vpc-endpoint-ids $EP_ID 2>/dev/null || true
+            echo "DELETED VPC endpoint: $EP_ID"
+          done
+
+          echo "-- Peering connections --"
+          PEER_IDS=$(aws ec2 describe-vpc-peering-connections --region $AWS_REGION \
+            --filters "Name=requester-vpc-info.vpc-id,Values=$VPC_ID" \
+            --query 'VpcPeeringConnections[].VpcPeeringConnectionId' --output text 2>/dev/null || true)
+          for PEER_ID in $PEER_IDS; do
+            aws ec2 delete-vpc-peering-connection --region $AWS_REGION \
+              --vpc-peering-connection-id $PEER_ID 2>/dev/null || true
+            echo "DELETED peering: $PEER_ID"
+          done
+
+          echo "-- Non-default SGs --"
           SG_IDS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || true)
@@ -413,11 +467,25 @@ jobs:
             echo "DELETED route table: $RT_ID"
           done
 
-          echo "-- Orphaned ENIs --"
+          echo "-- All ENIs --"
           ENI_IDS=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'NetworkInterfaces[?Status!=`in-use`].NetworkInterfaceId' --output text 2>/dev/null || true)
+            --query 'NetworkInterfaces[].NetworkInterfaceId' --output text 2>/dev/null || true)
           for ENI_ID in $ENI_IDS; do
+            ASSOC_ID=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
+              --network-interface-ids $ENI_ID \
+              --query 'NetworkInterfaces[0].Association.AssociationId' --output text 2>/dev/null || true)
+            if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ] && [ "$ASSOC_ID" != "null" ]; then
+              aws ec2 disassociate-address --region $AWS_REGION --association-id $ASSOC_ID 2>/dev/null || true
+            fi
+            ATTACH_ID=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
+              --network-interface-ids $ENI_ID \
+              --query 'NetworkInterfaces[0].Attachment.AttachmentId' --output text 2>/dev/null || true)
+            if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ] && [ "$ATTACH_ID" != "null" ]; then
+              aws ec2 detach-network-interface --region $AWS_REGION \
+                --attachment-id $ATTACH_ID --force 2>/dev/null || true
+              sleep 3
+            fi
             aws ec2 delete-network-interface --region $AWS_REGION --network-interface-id $ENI_ID 2>/dev/null || true
             echo "DELETED ENI: $ENI_ID"
           done
@@ -433,7 +501,26 @@ jobs:
           VPC_ID="vpc-0818d68617434d141"
           echo "=== DELETING VPC: $VPC_ID ==="
 
-          echo "-- Non-default security groups: revoke rules then delete --"
+          echo "-- VPC endpoints --"
+          EP_IDS=$(aws ec2 describe-vpc-endpoints --region $AWS_REGION \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'VpcEndpoints[?State!=`deleted`].VpcEndpointId' --output text 2>/dev/null || true)
+          for EP_ID in $EP_IDS; do
+            aws ec2 delete-vpc-endpoints --region $AWS_REGION --vpc-endpoint-ids $EP_ID 2>/dev/null || true
+            echo "DELETED VPC endpoint: $EP_ID"
+          done
+
+          echo "-- Peering connections --"
+          PEER_IDS=$(aws ec2 describe-vpc-peering-connections --region $AWS_REGION \
+            --filters "Name=requester-vpc-info.vpc-id,Values=$VPC_ID" \
+            --query 'VpcPeeringConnections[].VpcPeeringConnectionId' --output text 2>/dev/null || true)
+          for PEER_ID in $PEER_IDS; do
+            aws ec2 delete-vpc-peering-connection --region $AWS_REGION \
+              --vpc-peering-connection-id $PEER_ID 2>/dev/null || true
+            echo "DELETED peering: $PEER_ID"
+          done
+
+          echo "-- Non-default SGs --"
           SG_IDS=$(aws ec2 describe-security-groups --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
             --query 'SecurityGroups[?GroupName!=`default`].GroupId' --output text 2>/dev/null || true)
@@ -483,11 +570,25 @@ jobs:
             echo "DELETED route table: $RT_ID"
           done
 
-          echo "-- Orphaned ENIs --"
+          echo "-- All ENIs --"
           ENI_IDS=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
             --filters "Name=vpc-id,Values=$VPC_ID" \
-            --query 'NetworkInterfaces[?Status!=`in-use`].NetworkInterfaceId' --output text 2>/dev/null || true)
+            --query 'NetworkInterfaces[].NetworkInterfaceId' --output text 2>/dev/null || true)
           for ENI_ID in $ENI_IDS; do
+            ASSOC_ID=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
+              --network-interface-ids $ENI_ID \
+              --query 'NetworkInterfaces[0].Association.AssociationId' --output text 2>/dev/null || true)
+            if [ -n "$ASSOC_ID" ] && [ "$ASSOC_ID" != "None" ] && [ "$ASSOC_ID" != "null" ]; then
+              aws ec2 disassociate-address --region $AWS_REGION --association-id $ASSOC_ID 2>/dev/null || true
+            fi
+            ATTACH_ID=$(aws ec2 describe-network-interfaces --region $AWS_REGION \
+              --network-interface-ids $ENI_ID \
+              --query 'NetworkInterfaces[0].Attachment.AttachmentId' --output text 2>/dev/null || true)
+            if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != "None" ] && [ "$ATTACH_ID" != "null" ]; then
+              aws ec2 detach-network-interface --region $AWS_REGION \
+                --attachment-id $ATTACH_ID --force 2>/dev/null || true
+              sleep 3
+            fi
             aws ec2 delete-network-interface --region $AWS_REGION --network-interface-id $ENI_ID 2>/dev/null || true
             echo "DELETED ENI: $ENI_ID"
           done
@@ -503,56 +604,52 @@ jobs:
           BUCKET="udap-calculator-tf-state-a7f3k9"
           echo "=== S3 BUCKET: $BUCKET ==="
           aws s3api get-bucket-versioning --bucket $BUCKET 2>/dev/null || echo "Bucket may not exist"
-          echo "-- Deleting object versions in batches --"
+          echo "-- Object versions --"
           while true; do
             VERSIONS=$(aws s3api list-object-versions \
               --bucket $BUCKET --max-items 1000 \
               --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
               --output json 2>/dev/null || echo '{"Objects":null}')
             COUNT=$(echo "$VERSIONS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('Objects') or []))" 2>/dev/null || echo 0)
-            echo "Version batch count: $COUNT"
+            echo "Version batch: $COUNT"
             if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then break; fi
             aws s3api delete-objects --bucket $BUCKET --delete "$VERSIONS" --output json
-            echo "  Deleted $COUNT object versions."
           done
-          echo "-- Deleting delete markers in batches --"
+          echo "-- Delete markers --"
           while true; do
             MARKERS=$(aws s3api list-object-versions \
               --bucket $BUCKET --max-items 1000 \
               --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
               --output json 2>/dev/null || echo '{"Objects":null}')
             COUNT=$(echo "$MARKERS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('Objects') or []))" 2>/dev/null || echo 0)
-            echo "Delete marker batch count: $COUNT"
+            echo "Marker batch: $COUNT"
             if [ "$COUNT" = "0" ] || [ -z "$COUNT" ]; then break; fi
             aws s3api delete-objects --bucket $BUCKET --delete "$MARKERS" --output json
-            echo "  Deleted $COUNT delete markers."
           done
-          echo "-- Verifying bucket is empty --"
-          aws s3api list-object-versions --bucket $BUCKET --output json 2>/dev/null || true
           echo "-- Deleting bucket --"
           aws s3api delete-bucket --bucket $BUCKET --region $AWS_REGION
           echo "DELETED BUCKET: $BUCKET"
 
       # ── STEP 16: Final sweep ─────────────────────────────────────────────
-      - name: "Step 16 — Final sweep (confirm zero orphaned resources)"
+      - name: "Step 16 — Final sweep"
         run: |
           echo "=== FINAL SWEEP ==="
-          echo "--- EC2 (non-terminated, Name tag matches rke2 or calculator) ---"
+          echo "--- EC2 (rke2/calculator tagged, non-terminated) ---"
           aws ec2 describe-instances --region $AWS_REGION \
             --filters \
               "Name=instance-state-name,Values=pending,running,stopping,stopped" \
               "Name=tag:Name,Values=*rke2*,*calculator*" \
             --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,Tags:Tags}' \
             --output json 2>/dev/null || echo "[]"
-          echo "--- ALBs (rke2-*) ---"
+          echo "--- ALBs (rke2) ---"
           aws elbv2 describe-load-balancers --region $AWS_REGION \
-            --query 'LoadBalancers[?contains(LoadBalancerName,`rke2`)].{Name:LoadBalancerName,ARN:LoadBalancerArn}' \
+            --query 'LoadBalancers[?contains(LoadBalancerName,`rke2`)].{Name:LoadBalancerName}' \
             --output json 2>/dev/null || echo "[]"
           echo "--- Target groups (rke2/ingress) ---"
           aws elbv2 describe-target-groups --region $AWS_REGION \
             --query 'TargetGroups[?contains(TargetGroupName,`rke2`) || contains(TargetGroupName,`ingress`)].{Name:TargetGroupName}' \
             --output json 2>/dev/null || echo "[]"
-          echo "--- Security groups (non-default VPC, non-default named) ---"
+          echo "--- SGs (non-default VPC, non-default named) ---"
           aws ec2 describe-security-groups --region $AWS_REGION \
             --query 'SecurityGroups[?VpcId!=`'"$DEFAULT_VPC"'` && GroupName!=`default`].{ID:GroupId,Name:GroupName,VPC:VpcId}' \
             --output json 2>/dev/null || echo "[]"
@@ -560,7 +657,7 @@ jobs:
           aws ec2 describe-key-pairs --region $AWS_REGION \
             --filters "Name=key-name,Values=rke2*" \
             --query 'KeyPairs[].KeyName' --output json 2>/dev/null || echo "[]"
-          echo "--- Available EBS volumes ---"
+          echo "--- Available EBS ---"
           aws ec2 describe-volumes --region $AWS_REGION \
             --filters "Name=status,Values=available" \
             --query 'Volumes[].{ID:VolumeId,Size:Size,Tags:Tags}' \
@@ -573,15 +670,14 @@ jobs:
           aws iam list-roles \
             --query 'Roles[?contains(RoleName,`rke2`) || contains(RoleName,`calculator`)].RoleName' \
             --output json 2>/dev/null || echo "[]"
-          echo "--- ALL VPCs (expect only default vpc-08750793f051e477b) ---"
+          echo "--- ALL VPCs ---"
           aws ec2 describe-vpcs --region $AWS_REGION \
             --query 'Vpcs[].{ID:VpcId,CIDR:CidrBlock,IsDefault:IsDefault}' \
             --output json 2>/dev/null || echo "[]"
-          echo "--- VPC count ---"
           VPC_COUNT=$(aws ec2 describe-vpcs --region $AWS_REGION \
             --query 'length(Vpcs)' --output text 2>/dev/null || echo "unknown")
           echo "Total VPC count: $VPC_COUNT (expected: 1)"
-          echo "--- S3 buckets (calculator/rke2) ---"
+          echo "--- S3 (calculator/rke2) ---"
           aws s3api list-buckets \
             --query 'Buckets[?contains(Name,`calculator`) || contains(Name,`rke2`)].{Name:Name}' \
             --output json 2>/dev/null || echo "[]"
