@@ -24,10 +24,6 @@
     src: config.yaml.j2
     dest: /etc/rancher/rke2/config.yaml
     mode: '0644'
-  vars:
-    rke2_server_ip: "{{ hostvars['rke2_token_holder']['rke2_node_token'] is defined | ternary(hostvars['rke2_token_holder']['rke2_node_token'], '') }}"
-    rke2_token: "{{ hostvars['rke2_token_holder']['rke2_node_token'] }}"
-    server_private_ip: "{{ groups['rke2_server'][0] }}"
 
 - name: Download and install RKE2 agent
   ansible.builtin.shell: |

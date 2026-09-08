@@ -19,8 +19,8 @@ env:
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 1: Terraform — provision EC2 x2, ALB, SGs, key pair
-  # Uses local state (demo). name_prefix on all AWS resources avoids
-  # duplicate-name conflicts across runs.
+  # name_prefix on all AWS resources avoids duplicate-name conflicts.
+  # Local state per run — demo only.
   # ────────────────────────────────────────────────────────────────────────────
   terraform:
     name: Terraform — Provision Infrastructure
@@ -45,6 +45,10 @@ jobs:
 
       - name: Terraform Init (local backend)
         working-directory: terraform
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    us-east-1
         run: terraform init -input=false
 
       - name: Terraform Plan
@@ -139,16 +143,12 @@ jobs:
         run: |
           SERVER_IP="${{ needs.terraform.outputs.server_public_ip }}"
           AGENT_IP="${{ needs.terraform.outputs.agent_public_ip }}"
-
           mkdir -p ansible/inventory
-          cat > ansible/inventory/hosts.ini <<EOF
-          [rke2_server]
-          ${SERVER_IP} ansible_user=ubuntu ansible_ssh_private_key_file=../ansible/rke2-key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-
-          [rke2_agent]
-          ${AGENT_IP} ansible_user=ubuntu ansible_ssh_private_key_file=../ansible/rke2-key.pem ansible_ssh_common_args='-o StrictHostKeyChecking=no'
-          EOF
-
+          # Use printf to avoid heredoc indentation issues
+          printf '[rke2_server]\n' > ansible/inventory/hosts.ini
+          printf '%s ansible_user=ubuntu ansible_ssh_private_key_file=../ansible/rke2-key.pem ansible_ssh_common_args='"'"'-o StrictHostKeyChecking=no'"'"'\n' "$SERVER_IP" >> ansible/inventory/hosts.ini
+          printf '\n[rke2_agent]\n' >> ansible/inventory/hosts.ini
+          printf '%s ansible_user=ubuntu ansible_ssh_private_key_file=../ansible/rke2-key.pem ansible_ssh_common_args='"'"'-o StrictHostKeyChecking=no'"'"'\n' "$AGENT_IP" >> ansible/inventory/hosts.ini
           echo "Inventory written:"
           cat ansible/inventory/hosts.ini
 
