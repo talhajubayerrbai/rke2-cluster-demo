@@ -226,6 +226,7 @@ resource "aws_lb_target_group" "ingress" {
     path                = "/healthz"
     port                = "30080"
     protocol            = "HTTP"
+    matcher             = "200"
     healthy_threshold   = 2
     unhealthy_threshold = 3
     timeout             = 5
